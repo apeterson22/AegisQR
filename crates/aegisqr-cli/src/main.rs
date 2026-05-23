@@ -2,9 +2,9 @@ use std::fs;
 use std::path::PathBuf;
 
 use aegisqr_core::{
-    decrypt_agent_index, deny_execution_message, export_qr_packets, import_qr_packets,
-    inspect_header, pack_to_file, stage_capsule, unpack_capsule, verify_capsule, ClientPolicy,
-    CompressionProfile, PackOptions, PayloadType, TrustStore,
+    deny_execution_message, export_qr_packets, import_qr_packets, inspect_header, pack_to_file,
+    stage_capsule, unpack_capsule, verify_capsule, ClientPolicy, CompressionProfile, PackOptions,
+    PayloadType, TrustStore,
 };
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
@@ -176,6 +176,5 @@ fn main() -> Result<()> {
         },
     }
 
-    let _ = decrypt_agent_index;
     Ok(())
 }
