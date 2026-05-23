@@ -150,13 +150,14 @@ fn run_inspect() -> Result<()> {
 fn run_verify() -> Result<()> {
     let bundle = read_existing_path("Bundle path (.aqr)")?;
     let strict_trust = parse_yes_no(&read_line("Require strict trust store validation? [y/N]")?)?;
-    let trust_store = if strict_trust || parse_yes_no(&read_line("Provide trust store file? [y/N]")?)? {
-        let path = read_existing_path("Trust store JSON path")?;
-        let bytes = fs::read(path)?;
-        Some(serde_json::from_slice::<TrustStore>(&bytes)?)
-    } else {
-        None
-    };
+    let trust_store =
+        if strict_trust || parse_yes_no(&read_line("Provide trust store file? [y/N]")?)? {
+            let path = read_existing_path("Trust store JSON path")?;
+            let bytes = fs::read(path)?;
+            Some(serde_json::from_slice::<TrustStore>(&bytes)?)
+        } else {
+            None
+        };
 
     verify_capsule(&bundle, trust_store.as_ref(), strict_trust)?;
     println!("Verification succeeded");
