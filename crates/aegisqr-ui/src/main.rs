@@ -3,15 +3,19 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 use aegisqr_core::{
-    deny_execution_message, export_qr_packets, import_qr_packets, inspect_header, pack_to_file,
-    stage_capsule, unpack_capsule, verify_capsule, ClientPolicy, CompressionProfile, PackOptions,
-    PayloadType, TrustStore,
+    approve_capsule, deny_execution_message, export_qr_packets, import_qr_packets, inspect_full,
+    pack_to_file, stage_capsule, unpack_capsule, verify_capsule, AicxSidecar, ClientPolicy,
+    CompressionProfile, PackOptions, PayloadType, TrustStore,
+};
+use aegisqr_repo::{
+    validate_handoff_package, AuthConfig, AuthType, HandoffPackage, HandoffState,
+    RepositoryCoordinates,
 };
 use anyhow::{bail, Context, Result};
 use zeroize::Zeroize;
 
 fn main() -> Result<()> {
-    println!("AegisQR Interface");
+    println!("AegisQR Interface — Enterprise Edition");
     println!("Secure defaults: scan/decrypt/restore never execute payloads.");
 
     loop {
@@ -51,6 +55,16 @@ fn main() -> Result<()> {
                     eprintln!("Import failed: {err:#}");
                 }
             }
+            MenuAction::Approve => {
+                if let Err(err) = run_approve() {
+                    eprintln!("Approve failed: {err:#}");
+                }
+            }
+            MenuAction::Handoff => {
+                if let Err(err) = run_handoff() {
+                    eprintln!("Handoff failed: {err:#}");
+                }
+            }
             MenuAction::Exit => break,
         }
     }
@@ -67,6 +81,8 @@ enum MenuAction {
     Stage,
     ExportQr,
     ImportQr,
+    Approve,
+    Handoff,
     Exit,
 }
 
@@ -80,7 +96,9 @@ fn prompt_menu() -> Result<MenuAction> {
     println!("  5) Stage");
     println!("  6) Export QR");
     println!("  7) Import QR");
-    println!("  8) Exit");
+    println!("  8) Approve capsule");
+    println!("  9) Prepare handoff");
+    println!(" 10) Exit");
 
     let choice = read_line("Enter number")?;
     match choice.trim() {
@@ -91,7 +109,9 @@ fn prompt_menu() -> Result<MenuAction> {
         "5" => Ok(MenuAction::Stage),
         "6" => Ok(MenuAction::ExportQr),
         "7" => Ok(MenuAction::ImportQr),
-        "8" => Ok(MenuAction::Exit),
+        "8" => Ok(MenuAction::Approve),
+        "9" => Ok(MenuAction::Handoff),
+        "10" => Ok(MenuAction::Exit),
         _ => bail!("invalid menu choice"),
     }
 }
@@ -109,8 +129,17 @@ fn run_pack() -> Result<()> {
     passphrase_confirm.zeroize();
 
     let compression = parse_compression(&read_line("Compression [none|fast|balanced|qr-basic]")?)?;
-    let payload_type = if parse_yes_no(&read_line("Treat input as AICX archive? [y/N]")?)? {
+    let is_aicx = parse_yes_no(&read_line("Treat input as AICX archive? [y/N]")?)?;
+    let payload_type = if is_aicx {
         Some(PayloadType::AicxArchive)
+    } else {
+        None
+    };
+
+    let aicx_sidecar = if is_aicx && parse_yes_no(&read_line("Embed AICX sidecar JSON? [y/N]")?)? {
+        let sidecar_path = read_existing_path("AICX sidecar JSON path")?;
+        let bytes = fs::read(&sidecar_path)?;
+        Some(serde_json::from_slice::<AicxSidecar>(&bytes)?)
     } else {
         None
     };
@@ -129,6 +158,7 @@ fn run_pack() -> Result<()> {
         auto_execute_capable,
         auto_execute_requested,
         payload_type,
+        aicx_sidecar,
         ..PackOptions::default()
     };
 
@@ -142,8 +172,8 @@ fn run_pack() -> Result<()> {
 
 fn run_inspect() -> Result<()> {
     let bundle = read_existing_path("Bundle path (.aqr)")?;
-    let header = inspect_header(&bundle)?;
-    println!("{}", serde_json::to_string_pretty(&header)?);
+    let report = inspect_full(&bundle)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
 }
 
@@ -200,6 +230,140 @@ fn run_import_qr() -> Result<()> {
     import_qr_packets(&qr_dir, &out)?;
     println!("Imported QR packets -> {}", out.display());
     Ok(())
+}
+
+fn run_approve() -> Result<()> {
+    let bundle = read_existing_path("Bundle path (.aqr)")?;
+
+    let approver_id = {
+        let v = read_line("Approver ID (must match an entry in enterprise_policy.approvers)")?;
+        if v.is_empty() {
+            bail!("approver ID cannot be empty");
+        }
+        v
+    };
+
+    let key_path = read_existing_path("Signing key file path (hex-encoded 32-byte Ed25519 seed)")?;
+    let seed = load_signing_key(&key_path)?;
+
+    let overwrite = parse_yes_no(&read_line("Overwrite input bundle? [y/N]")?)?;
+    let out = if overwrite {
+        bundle.clone()
+    } else {
+        read_path("Output bundle path")?
+    };
+
+    let token = approve_capsule(&bundle, &approver_id, &seed, &out)?;
+    println!("Approval token appended");
+    println!("  approver_id : {}", token.approver_id);
+    println!("  approved_at : {}", token.approved_at);
+    println!("  bundle_id   : {}", token.bundle_id);
+    println!("Written to {}", out.display());
+    Ok(())
+}
+
+fn run_handoff() -> Result<()> {
+    let bundle = read_existing_path("Bundle path (.aqr)")?;
+
+    // Extract embedded AICX sidecar.
+    let capsule = aegisqr_core::read_capsule_file(&bundle)?;
+    let aicx_sidecar = capsule.agent_index.aicx_sidecar.ok_or_else(|| {
+        anyhow::anyhow!("no AICX sidecar embedded — pack with an AICX sidecar JSON first")
+    })?;
+
+    println!("Target repository coordinates:");
+    let repo_type_str = read_line("Repo type [artifactory|nexus]")?;
+    let repo_type = match repo_type_str.trim().to_ascii_lowercase().as_str() {
+        "nexus" => aegisqr_core::RepoType::Nexus,
+        _ => aegisqr_core::RepoType::Artifactory,
+    };
+    let base_url = {
+        let v = read_line("Base URL (e.g. https://repo.example.com)")?;
+        if v.is_empty() {
+            bail!("base URL cannot be empty");
+        }
+        v
+    };
+    let repository = read_line("Repository name")?;
+    let group = read_line("Group / namespace")?;
+    let name = read_line("Artifact name")?;
+    let version = read_line("Version")?;
+    let classifier = {
+        let v = read_line("Classifier (optional, press Enter to skip)")?;
+        if v.is_empty() {
+            None
+        } else {
+            Some(v)
+        }
+    };
+
+    let target_coords = RepositoryCoordinates {
+        repo_type,
+        base_url,
+        repository,
+        group,
+        name,
+        version,
+        classifier,
+    };
+
+    let trust_store = if parse_yes_no(&read_line("Provide trust store file? [y/N]")?)? {
+        let path = read_existing_path("Trust store JSON path")?;
+        let bytes = fs::read(path)?;
+        Some(serde_json::from_slice::<TrustStore>(&bytes)?)
+    } else {
+        None
+    };
+
+    let out = read_path("Output handoff-package.json path [handoff-package.json]")
+        .unwrap_or_else(|_| PathBuf::from("handoff-package.json"));
+
+    let pkg = HandoffPackage {
+        capsule_path: bundle,
+        aicx_sidecar,
+        audit_log: capsule.audit_log,
+        approval_tokens: vec![],
+        target_coords,
+        auth_config: Some(AuthConfig {
+            auth_type: AuthType::Bearer,
+            token: None,
+        }),
+        serialization_profile: aegisqr_repo::SerializationProfile::Json,
+    };
+
+    let result = validate_handoff_package(&pkg, trust_store.as_ref())?;
+    println!("{}", serde_json::to_string_pretty(&result.event)?);
+
+    match &result.state {
+        HandoffState::Approved => println!("\nState: APPROVED — ready for plugin ingestion"),
+        HandoffState::AwaitingApproval => {
+            println!("\nState: AWAITING APPROVAL — add more approval tokens first")
+        }
+        HandoffState::Failed(msg) => println!("\nState: FAILED — {msg}"),
+        other => println!("\nState: {}", serde_json::to_string(other)?),
+    }
+
+    let dry_run = parse_yes_no(&read_line("Dry run only? (skip writing file) [y/N]")?)?;
+    if !dry_run {
+        let json = serde_json::to_string_pretty(&pkg)?;
+        fs::write(&out, json)?;
+        println!("Written to {}", out.display());
+    }
+    Ok(())
+}
+
+/// Reads and hex-decodes a 32-byte Ed25519 seed from `path`.
+fn load_signing_key(path: &std::path::Path) -> Result<Vec<u8>> {
+    let raw = fs::read_to_string(path)?;
+    let bytes = hex::decode(raw.trim())
+        .map_err(|e| anyhow::anyhow!("signing key file is not valid hex: {e}"))?;
+    if bytes.len() != 32 {
+        bail!(
+            "signing key must be 32 bytes ({} bytes decoded, expected 32)",
+            bytes.len()
+        );
+    }
+    Ok(bytes)
 }
 
 fn read_path(prompt: &str) -> Result<PathBuf> {

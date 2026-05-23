@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+aegisqr-agent = { path = "../aegisqr-agent" }
+aegisqr-audit = { path = "../aegisqr-audit" }
+aegisqr-policy = { path = "../aegisqr-policy" }
 anyhow.workspace = true
 argon2.workspace = true
 aes-gcm.workspace = true
