@@ -11,6 +11,7 @@ members = [
   "crates/aegisqr-recovery",
   "crates/aegisqr-runtime",
   "crates/aegisqr-audit",
+  "crates/aegisqr-ui",
 ]
 resolver = "2"
 

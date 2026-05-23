@@ -35,6 +35,16 @@ aegisqr import qr <qr-dir> --out <recovered.aqr>
 aegisqr stage <bundle.aqr> --out <staging-dir> --passphrase <pass>
 ```
 
+## Interface app (lightweight alternative to CLI)
+
+Run the interactive interface:
+
+```bash
+cargo run -p aegisqr-ui
+```
+
+It provides guided prompts for pack/inspect/verify/unpack/stage/export/import flows while preserving secure defaults (no automatic payload execution).
+
 ## Project status
 
 MVP starter is implemented with Rust-first workspace crates, AQR1 capsule data model, deterministic serialization, compression, passphrase encryption, Ed25519 signing, QR packet export/import, safe staging/quarantine, tests, and CI.

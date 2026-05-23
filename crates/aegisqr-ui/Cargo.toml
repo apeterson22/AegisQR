@@ -1,0 +1,12 @@
+[package]
+name = "aegisqr-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+aegisqr-core = { path = "../aegisqr-core" }
+rpassword = "7.4.0"
+serde_json = { workspace = true }
+zeroize = { workspace = true }
