@@ -409,7 +409,7 @@ AICX is a separate repository. AegisQR includes an integration interface (`paylo
 MVP is implemented with:
 
 - Rust-first workspace crates
-- AQR1 capsule data model and deterministic serialisation
+- AQR1 capsule data model and deterministic serialization
 - Passphrase encryption, Ed25519 signing, zstd compression
 - QR packet export and import with full hash verification
 - Safe staging and quarantine with path-traversal and symlink protection

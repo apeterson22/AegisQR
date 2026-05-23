@@ -365,7 +365,7 @@ pub fn pack_to_file(
 }
 
 pub fn pack(input: &Path, passphrase: &str, options: PackOptions) -> Result<Capsule> {
-    // auto_execute_requested requires auto_execute_capable; normalise to avoid a
+    // auto_execute_requested requires auto_execute_capable; normalize to avoid a
     // contradictory capsule where the public header declares the capsule is not
     // capable of auto-execution but the agent index declares it should execute.
     let auto_execute_capable = options.auto_execute_capable;
