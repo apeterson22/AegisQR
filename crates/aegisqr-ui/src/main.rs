@@ -353,7 +353,7 @@ fn run_handoff() -> Result<()> {
 }
 
 /// Reads and hex-decodes a 32-byte Ed25519 seed from `path`.
-fn load_signing_key(path: &PathBuf) -> Result<Vec<u8>> {
+fn load_signing_key(path: &std::path::Path) -> Result<Vec<u8>> {
     let raw = fs::read_to_string(path)?;
     let bytes = hex::decode(raw.trim())
         .map_err(|e| anyhow::anyhow!("signing key file is not valid hex: {e}"))?;

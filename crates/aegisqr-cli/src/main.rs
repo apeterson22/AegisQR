@@ -341,7 +341,7 @@ fn parse_serialization_profile(s: &str) -> aegisqr_repo::SerializationProfile {
 }
 
 /// Reads a hex-encoded 32-byte Ed25519 seed from `path`.
-fn load_signing_key(path: &PathBuf) -> Result<Vec<u8>> {
+fn load_signing_key(path: &std::path::Path) -> Result<Vec<u8>> {
     let raw = fs::read_to_string(path)?;
     let trimmed = raw.trim();
     let bytes = hex::decode(trimmed)

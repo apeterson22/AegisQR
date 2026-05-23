@@ -204,7 +204,11 @@ pub struct HandoffEvent {
     pub job_id: String,
     pub bundle_id: String,
     pub state: HandoffState,
-    /// Unix timestamp of the transition (seconds since epoch).
+    /// Unix timestamp of the transition as a decimal string.
+    ///
+    /// Stored as `String` rather than `u64` to ensure consistent JSON
+    /// representation across languages and avoid integer-overflow issues in
+    /// consumers that parse 32-bit integers.
     pub timestamp: String,
     /// Serialization profile used by the event producer.
     #[serde(default)]
@@ -323,8 +327,13 @@ pub fn validate_handoff_package(
         .unwrap_or_default()
         .as_secs();
 
-    // Count tokens from both the capsule (embedded by `aegisqr approve`) and
-    // any externally-provided tokens in the handoff package.
+    // Count tokens from both the capsule (embedded via `aegisqr approve`) and
+    // any externally-provided out-of-band tokens in the handoff package.
+    //
+    // Typical flow: `aegisqr approve` embeds tokens in the capsule file;
+    // `HandoffPackage.approval_tokens` is reserved for approvals obtained
+    // through a separate approval system that cannot modify the capsule file
+    // (e.g. an approval portal that returns signed tokens as JSON).
     let all_tokens = capsule
         .approval_tokens
         .iter()
