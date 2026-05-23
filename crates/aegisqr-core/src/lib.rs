@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use argon2::Argon2;
@@ -15,6 +16,11 @@ use sha2::{Digest, Sha256};
 use tar::{Archive, Builder, Header};
 use walkdir::WalkDir;
 use zeroize::Zeroize;
+
+// Re-export sub-crate types so consumers only need `aegisqr-core` as a dep.
+pub use aegisqr_agent::{AicxSidecar, ArtifactCoordinate, ProvenanceRecord, SerializationProfile};
+pub use aegisqr_audit::{ApprovalToken, AuditAction, AuditEvent, AuditRecord};
+pub use aegisqr_policy::{EnterprisePolicy, RepoTarget, RepoType};
 
 pub const AQR_MAGIC: &[u8; 4] = b"AQR1";
 pub const AQR_VERSION: u32 = 1;
@@ -111,7 +117,7 @@ pub struct AgentIndex {
     pub input_schema_placeholder: Option<String>,
     pub risk_level: String,
     pub auto_execute_declaration: bool,
-    pub aicx_sidecar_reference_placeholder: Option<String>,
+    pub aicx_sidecar: Option<AicxSidecar>,
     pub toon_export_placeholder: Option<String>,
 }
 
@@ -160,7 +166,16 @@ pub struct Capsule {
     pub signature_block: SignatureBlock,
     pub chunk_table: Vec<ChunkEntry>,
     pub recovery_metadata_placeholder: Option<String>,
-    pub audit_metadata_placeholder: Option<String>,
+    /// Enterprise approval and routing policy.  `None` means no approval gate.
+    #[serde(default)]
+    pub enterprise_policy: Option<EnterprisePolicy>,
+    /// Chronological audit trail accumulated across the capsule's lifecycle.
+    #[serde(default)]
+    pub audit_log: Vec<AuditRecord>,
+    /// Approval tokens endorsing this capsule.  Each token carries its own
+    /// Ed25519 signature and is independent of the capsule's primary signature.
+    #[serde(default)]
+    pub approval_tokens: Vec<ApprovalToken>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -339,6 +354,11 @@ pub struct PackOptions {
     pub auto_execute_capable: bool,
     pub auto_execute_requested: bool,
     pub payload_type: Option<PayloadType>,
+    /// Optional AICX sidecar to embed in the capsule's `agent_index`.
+    ///
+    /// When provided for an `AicxArchive` payload, AegisQR validates the
+    /// sidecar's `manifest_hash` against the archive bytes before sealing.
+    pub aicx_sidecar: Option<AicxSidecar>,
 }
 
 impl Default for PackOptions {
@@ -349,6 +369,7 @@ impl Default for PackOptions {
             auto_execute_capable: false,
             auto_execute_requested: false,
             payload_type: None,
+            aicx_sidecar: None,
         }
     }
 }
@@ -379,6 +400,25 @@ pub fn pack(input: &Path, passphrase: &str, options: PackOptions) -> Result<Caps
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "payload".into());
     let prepared = prepare_payload(input, &payload_type)?;
+
+    // If an AICX sidecar is provided, validate its manifest_hash against the
+    // archive bytes before sealing.  This ensures the sidecar and the packed
+    // payload are consistent without AegisQR needing to parse archive internals.
+    if payload_type == PayloadType::AicxArchive {
+        if let Some(ref sidecar) = options.aicx_sidecar {
+            if !sidecar.manifest_hash.is_empty() {
+                let actual = hash_bytes(&prepared);
+                if actual != sidecar.manifest_hash {
+                    bail!(
+                        "AICX sidecar manifest_hash mismatch: sidecar has {}, archive hashes to {}",
+                        sidecar.manifest_hash,
+                        actual
+                    );
+                }
+            }
+        }
+    }
+
     let compressed = compress(&prepared, options.compression.clone())?;
 
     let bundle_id =
@@ -389,6 +429,14 @@ pub fn pack(input: &Path, passphrase: &str, options: PackOptions) -> Result<Caps
     let (salt, nonce, ciphertext, payload_hash) =
         encrypt_payload(passphrase, &bundle_id, &policy, &compressed)?;
     let encrypted_hash = hash_bytes(&ciphertext);
+
+    let pack_event = AuditEvent {
+        timestamp: created_at.clone(),
+        actor: "local".into(),
+        action: AuditAction::Pack,
+        result: "ok".into(),
+        notes: None,
+    };
 
     let mut capsule = Capsule {
         public_header: PublicHeader {
@@ -422,7 +470,7 @@ pub fn pack(input: &Path, passphrase: &str, options: PackOptions) -> Result<Caps
             input_schema_placeholder: Some("future-input-schema".into()),
             risk_level: "medium".into(),
             auto_execute_declaration,
-            aicx_sidecar_reference_placeholder: Some("future-aicx-sidecar".into()),
+            aicx_sidecar: options.aicx_sidecar,
             toon_export_placeholder: Some("future-toon-export".into()),
         },
         semantic_index_placeholder: Some("future-semantic-index".into()),
@@ -448,7 +496,11 @@ pub fn pack(input: &Path, passphrase: &str, options: PackOptions) -> Result<Caps
         },
         chunk_table: vec![],
         recovery_metadata_placeholder: Some("future-recovery-metadata".into()),
-        audit_metadata_placeholder: Some("future-audit-metadata".into()),
+        enterprise_policy: None,
+        audit_log: vec![AuditRecord {
+            events: vec![pack_event],
+        }],
+        approval_tokens: vec![],
     };
 
     capsule.chunk_table = build_chunk_table(&capsule.payload_section.ciphertext, 1024);
@@ -654,6 +706,31 @@ pub fn verify_capsule(
             bail!("chunk hash mismatch");
         }
     }
+
+    // Enterprise approval gate: require the minimum number of valid approval
+    // tokens from authorised approvers before allowing the capsule through.
+    if let Some(ref policy) = capsule.enterprise_policy {
+        if policy.approval_required {
+            let now = unix_now();
+            let valid = capsule
+                .approval_tokens
+                .iter()
+                .filter(|t| {
+                    policy.approvers.contains(&t.approver_id)
+                        && t.bundle_id == capsule.public_header.bundle_id
+                        && t.verify().is_ok()
+                        && t.check_ttl(policy.approval_ttl_seconds, now).is_ok()
+                })
+                .count();
+            if valid < policy.min_approvals as usize {
+                bail!(
+                    "insufficient approvals: {valid} valid, {} required",
+                    policy.min_approvals
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -939,13 +1016,120 @@ pub fn deny_execution_message(policy: &ClientPolicy, auto_execute_requested: boo
     }
 }
 
+// ─── Inspection ──────────────────────────────────────────────────────────────
+
+/// A lightweight summary of enterprise policy suitable for inspection output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnterprisePolicySummary {
+    pub approval_required: bool,
+    pub min_approvals: u8,
+    /// Number of authorised approvers listed in the policy.
+    pub approvers_count: usize,
+    pub repo_target: Option<RepoTarget>,
+}
+
+/// Public-facing inspection report for a capsule — no decryption required.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapsuleInspection {
+    pub public_header: PublicHeader,
+    pub aicx_sidecar: Option<AicxSidecar>,
+    pub enterprise_policy: Option<EnterprisePolicySummary>,
+    /// Number of approval tokens currently embedded in the capsule.
+    pub approval_count: usize,
+    /// Total number of audit events across all audit records.
+    pub audit_event_count: usize,
+}
+
+/// Returns a rich inspection report without decrypting the capsule payload.
+pub fn inspect_full(path: &Path) -> Result<CapsuleInspection> {
+    let capsule = read_capsule_file(path)?;
+    Ok(CapsuleInspection {
+        aicx_sidecar: capsule.agent_index.aicx_sidecar,
+        enterprise_policy: capsule.enterprise_policy.map(|p| EnterprisePolicySummary {
+            approval_required: p.approval_required,
+            min_approvals: p.min_approvals,
+            approvers_count: p.approvers.len(),
+            repo_target: p.repo_target,
+        }),
+        approval_count: capsule.approval_tokens.len(),
+        audit_event_count: capsule.audit_log.iter().map(|r| r.events.len()).sum(),
+        public_header: capsule.public_header,
+    })
+}
+
+// ─── Approval ────────────────────────────────────────────────────────────────
+
+/// Creates a signed [`ApprovalToken`] using the provided raw 32-byte Ed25519 seed.
+///
+/// The signing payload is `"{bundle_id}|{approver_id}|{approved_at}"`.
+pub fn create_approval_token(
+    bundle_id: &str,
+    approver_id: &str,
+    signing_key_seed: &[u8],
+) -> Result<ApprovalToken> {
+    let seed: &[u8; 32] = signing_key_seed
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("signing key seed must be exactly 32 bytes"))?;
+    let signing_key = SigningKey::from_bytes(seed);
+    let approved_at = chrono_like_now();
+    let mut token = ApprovalToken {
+        bundle_id: bundle_id.to_string(),
+        approver_id: approver_id.to_string(),
+        approved_at,
+        signature: vec![],
+        public_key: signing_key.verifying_key().to_bytes().to_vec(),
+    };
+    let sig = signing_key.sign(&token.signing_payload());
+    token.signature = sig.to_bytes().to_vec();
+    Ok(token)
+}
+
+/// Appends a signed approval token to an existing capsule file.
+///
+/// The original Ed25519 signature covering the capsule's core content is
+/// unaffected: approval tokens are stored separately and carry their own
+/// signatures.  Writes the result to `out` (which may equal `path`).
+pub fn approve_capsule(
+    path: &Path,
+    approver_id: &str,
+    signing_key_seed: &[u8],
+    out: &Path,
+) -> Result<ApprovalToken> {
+    let mut capsule = read_capsule_file(path)?;
+    let token = create_approval_token(
+        &capsule.public_header.bundle_id.clone(),
+        approver_id,
+        signing_key_seed,
+    )?;
+    capsule.approval_tokens.push(token.clone());
+    capsule.audit_log.push(AuditRecord {
+        events: vec![AuditEvent {
+            timestamp: chrono_like_now(),
+            actor: approver_id.to_string(),
+            action: AuditAction::Approve,
+            result: "ok".into(),
+            notes: Some(format!(
+                "approval token issued for bundle {}",
+                capsule.public_header.bundle_id
+            )),
+        }],
+    });
+    write_capsule_file(out, &capsule)?;
+    Ok(token)
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
 fn chrono_like_now() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now()
+    let ts = unix_now();
+    format!("{ts}")
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs();
-    format!("{ts}")
+        .as_secs()
 }
 
 #[cfg(test)]
