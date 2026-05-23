@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8,5 +10,6 @@ pub struct RecoveryProfile {
 }
 
 pub fn missing_chunks(total: u32, present: &[u32]) -> Vec<u32> {
-    (0..total).filter(|i| !present.contains(i)).collect()
+    let present_set: BTreeSet<u32> = present.iter().copied().collect();
+    (0..total).filter(|i| !present_set.contains(i)).collect()
 }

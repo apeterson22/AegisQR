@@ -365,6 +365,12 @@ pub fn pack_to_file(
 }
 
 pub fn pack(input: &Path, passphrase: &str, options: PackOptions) -> Result<Capsule> {
+    // auto_execute_requested requires auto_execute_capable; normalise to avoid a
+    // contradictory capsule where the public header declares the capsule is not
+    // capable of auto-execution but the agent index declares it should execute.
+    let auto_execute_capable = options.auto_execute_capable;
+    let auto_execute_declaration = options.auto_execute_requested && auto_execute_capable;
+
     let payload_type = options
         .payload_type
         .unwrap_or_else(|| detect_payload_type(input));
@@ -396,7 +402,7 @@ pub fn pack(input: &Path, passphrase: &str, options: PackOptions) -> Result<Caps
             recovery_required: false,
             encrypted: true,
             signed: true,
-            auto_execute_capable: options.auto_execute_capable,
+            auto_execute_capable,
             auto_execute_default: false,
             requires_signature: true,
             requires_policy: true,
@@ -415,7 +421,7 @@ pub fn pack(input: &Path, passphrase: &str, options: PackOptions) -> Result<Caps
             expected_outputs: vec!["restored-payload".into()],
             input_schema_placeholder: Some("future-input-schema".into()),
             risk_level: "medium".into(),
-            auto_execute_declaration: options.auto_execute_requested,
+            auto_execute_declaration,
             aicx_sidecar_reference_placeholder: Some("future-aicx-sidecar".into()),
             toon_export_placeholder: Some("future-toon-export".into()),
         },
@@ -461,6 +467,12 @@ pub fn pack(input: &Path, passphrase: &str, options: PackOptions) -> Result<Caps
 fn build_section_table(c: &Capsule) -> Result<Vec<SectionEntry>> {
     let mut entries = Vec::new();
     let mut offset = 0u64;
+    // NOTE: "signature_block" is intentionally excluded here.  Its hash cannot
+    // be computed before the signing key is generated (chicken-and-egg), so
+    // including a hash of the empty placeholder would always be wrong.
+    // Integrity of the signature_block is guaranteed by the Ed25519 signature
+    // itself, which already covers the public key, bundle identity, and all
+    // other section hashes through the signed payload.
     let sections = vec![
         (
             "public_header",
@@ -497,15 +509,6 @@ fn build_section_table(c: &Capsule) -> Result<Vec<SectionEntry>> {
             vec!["unpack".into(), "stage".into()],
             "application/octet-stream".into(),
             vec!["encrypted".into()],
-        ),
-        (
-            "signature_block",
-            deterministic_cbor(&c.signature_block)?,
-            false,
-            false,
-            vec!["verify".into()],
-            "application/cbor".into(),
-            vec!["signature".into()],
         ),
         (
             "chunk_table",
@@ -834,7 +837,9 @@ pub fn export_qr_packets(
         }
 
         #[cfg(not(feature = "qr-png"))]
-        let _ = write_png;
+        if write_png {
+            bail!("PNG QR export requested but the 'qr-png' feature is not compiled in; rebuild with --features qr-png");
+        }
     }
     Ok(())
 }
@@ -1141,6 +1146,7 @@ mod tests {
             &bundle,
             "pw",
             PackOptions {
+                auto_execute_capable: true,
                 auto_execute_requested: true,
                 ..PackOptions::default()
             },
@@ -1205,5 +1211,54 @@ mod tests {
         .unwrap();
         let recovered = dir.path().join("recovered.aqr");
         assert!(import_qr_packets(&qr, &recovered).is_err());
+    }
+
+    #[test]
+    fn auto_execute_requested_without_capable_is_normalised_to_false() {
+        // Bug-fix regression: if auto_execute_capable is false, the capsule must
+        // not declare auto_execute_declaration=true even when
+        // auto_execute_requested=true, because that would contradict the public
+        // header's capability flag.
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("a.txt");
+        fs::write(&src, b"hello").unwrap();
+        let bundle = dir.path().join("x.aqr");
+        pack_to_file(
+            &src,
+            &bundle,
+            "pw",
+            PackOptions {
+                auto_execute_capable: false,
+                auto_execute_requested: true,
+                ..PackOptions::default()
+            },
+        )
+        .unwrap();
+        let capsule = read_capsule_file(&bundle).unwrap();
+        assert!(!capsule.public_header.auto_execute_capable);
+        assert!(!capsule.agent_index.auto_execute_declaration);
+    }
+
+    #[test]
+    fn section_table_does_not_contain_stale_signature_block_hash() {
+        // Bug-fix regression: the section_table used to include a "signature_block"
+        // entry hashed from the empty placeholder before signing.  That hash was
+        // always wrong once the real key/signature were written.  The entry is now
+        // omitted from the section table.
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("a.txt");
+        fs::write(&src, b"hello").unwrap();
+        let bundle = dir.path().join("x.aqr");
+        pack_to_file(&src, &bundle, "pw", PackOptions::default()).unwrap();
+        let capsule = read_capsule_file(&bundle).unwrap();
+        assert!(
+            !capsule
+                .section_table
+                .iter()
+                .any(|e| e.section_id == "signature_block"),
+            "section_table must not contain a stale hash for signature_block"
+        );
+        // Signature verification must still succeed.
+        verify_signature(&capsule).unwrap();
     }
 }
