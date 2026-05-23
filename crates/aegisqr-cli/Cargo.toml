@@ -1,0 +1,12 @@
+[package]
+name = "aegisqr-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+aegisqr-core = { path = "../aegisqr-core" }
+zeroize.workspace = true
