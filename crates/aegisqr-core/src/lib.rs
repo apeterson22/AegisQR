@@ -699,7 +699,7 @@ fn restore_capsule(path: &Path, out_dir: &Path, passphrase: &str, force_stage: b
 
     match capsule.payload_section.payload_type {
         PayloadType::RawFile | PayloadType::AicxArchive => {
-            let target = out_dir.join(&capsule.payload_section.original_name);
+            let target = safe_join(out_dir, Path::new(&capsule.payload_section.original_name))?;
             write_payload_file(target, &extracted, force_stage)?;
         }
         PayloadType::DirectoryTar => {
@@ -750,6 +750,11 @@ fn validate_relative(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn safe_join(base: &Path, rel: &Path) -> Result<PathBuf> {
+    validate_relative(rel)?;
+    Ok(base.join(rel))
+}
+
 fn write_payload_file(path: PathBuf, data: &[u8], force_stage: bool) -> Result<()> {
     let file_name = path
         .file_name()
@@ -791,6 +796,9 @@ pub fn export_qr_packets(
     packet_size: usize,
     write_png: bool,
 ) -> Result<()> {
+    if packet_size == 0 {
+        bail!("packet_size must be greater than zero");
+    }
     let bytes = fs::read(bundle_path)?;
     if bytes.len() < 4 || &bytes[..4] != AQR_MAGIC {
         bail!("invalid capsule magic");
@@ -863,6 +871,12 @@ pub fn import_qr_packets(packet_dir: &Path, out_path: &Path) -> Result<()> {
 
     let mut by_index: BTreeMap<u32, QrPacket> = BTreeMap::new();
     for packet in packets {
+        if packet.magic != "AQRP" {
+            bail!("invalid packet magic");
+        }
+        if packet.version != AQR_VERSION {
+            bail!("unsupported packet version");
+        }
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(packet.payload_b64.as_bytes())
             .context("invalid packet base64")?;
@@ -880,6 +894,17 @@ pub fn import_qr_packets(packet_dir: &Path, out_path: &Path) -> Result<()> {
 
     let first = by_index.values().next().unwrap();
     let total = first.total;
+    if total == 0 {
+        bail!("invalid packet total");
+    }
+    for packet in by_index.values() {
+        if packet.total != total {
+            bail!("inconsistent packet totals");
+        }
+        if packet.capsule_hash != first.capsule_hash {
+            bail!("inconsistent capsule hash across packets");
+        }
+    }
     for i in 0..total {
         if !by_index.contains_key(&i) {
             bail!("missing chunk {i}");
@@ -1130,5 +1155,55 @@ mod tests {
         assert!(index.auto_execute_declaration);
         let denied = deny_execution_message(&ClientPolicy::default(), true);
         assert!(denied.contains("disabled by client policy"));
+    }
+
+    #[test]
+    fn path_traversal_in_raw_original_name_is_blocked() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("safe.txt");
+        fs::write(&src, b"safe").unwrap();
+        let bundle = dir.path().join("safe.aqr");
+        pack_to_file(&src, &bundle, "pw", PackOptions::default()).unwrap();
+
+        let mut capsule = read_capsule_file(&bundle).unwrap();
+        capsule.payload_section.original_name = "../escape.txt".into();
+        write_capsule_file(&bundle, &capsule).unwrap();
+
+        let out = dir.path().join("out");
+        assert!(unpack_capsule(&bundle, &out, "pw").is_err());
+        assert!(!dir.path().join("escape.txt").exists());
+    }
+
+    #[test]
+    fn export_qr_packet_size_zero_fails() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("a.txt");
+        fs::write(&src, b"abc").unwrap();
+        let out = dir.path().join("x.aqr");
+        pack_to_file(&src, &out, "pw", PackOptions::default()).unwrap();
+        let qr = dir.path().join("qr");
+        assert!(export_qr_packets(&out, &qr, 0, false).is_err());
+    }
+
+    #[test]
+    fn import_qr_rejects_bad_magic() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("a.txt");
+        fs::write(&src, b"abc").unwrap();
+        let out = dir.path().join("x.aqr");
+        pack_to_file(&src, &out, "pw", PackOptions::default()).unwrap();
+        let qr = dir.path().join("qr");
+        export_qr_packets(&out, &qr, 32, false).unwrap();
+
+        let mut packet: QrPacket =
+            serde_cbor::from_slice(&fs::read(qr.join("packet-0000.cbor")).unwrap()).unwrap();
+        packet.magic = "BAD!".into();
+        fs::write(
+            qr.join("packet-0000.cbor"),
+            serde_cbor::to_vec(&packet).unwrap(),
+        )
+        .unwrap();
+        let recovered = dir.path().join("recovered.aqr");
+        assert!(import_qr_packets(&qr, &recovered).is_err());
     }
 }
