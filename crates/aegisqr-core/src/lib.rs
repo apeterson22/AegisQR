@@ -13,6 +13,7 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tar::{Archive, Builder, Header};
 use walkdir::WalkDir;
 use zeroize::Zeroize;
@@ -204,7 +205,7 @@ impl TrustStore {
     pub fn is_trusted(&self, signer_id: &str, public_key: &[u8]) -> bool {
         self.trusted_signers
             .get(signer_id)
-            .map(|k| k == public_key)
+            .map(|k| bool::from(k.as_slice().ct_eq(public_key)))
             .unwrap_or(false)
     }
 }
@@ -795,9 +796,7 @@ fn restore_tar(bytes: &[u8], out_dir: &Path, force_stage: bool) -> Result<()> {
         let mut file = file?;
         let path = file.path()?;
         let rel = path.as_ref();
-        validate_relative(rel)?;
-
-        let target = out_dir.join(rel);
+        let target = safe_join(out_dir, rel)?;
         if file.header().entry_type().is_symlink() || file.header().entry_type().is_hard_link() {
             bail!("symlink escape is blocked");
         }
@@ -1067,9 +1066,12 @@ pub fn create_approval_token(
     approver_id: &str,
     signing_key_seed: &[u8],
 ) -> Result<ApprovalToken> {
-    let seed: &[u8; 32] = signing_key_seed
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("signing key seed must be exactly 32 bytes"))?;
+    let seed: &[u8; 32] = signing_key_seed.try_into().map_err(|_| {
+        anyhow::anyhow!(
+            "signing key seed must be exactly 32 bytes (got {})",
+            signing_key_seed.len()
+        )
+    })?;
     let signing_key = SigningKey::from_bytes(seed);
     let approved_at = chrono_like_now();
     let mut token = ApprovalToken {
@@ -1097,7 +1099,7 @@ pub fn approve_capsule(
 ) -> Result<ApprovalToken> {
     let mut capsule = read_capsule_file(path)?;
     let token = create_approval_token(
-        &capsule.public_header.bundle_id.clone(),
+        &capsule.public_header.bundle_id,
         approver_id,
         signing_key_seed,
     )?;
