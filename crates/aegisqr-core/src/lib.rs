@@ -214,6 +214,10 @@ pub fn hash_bytes(data: &[u8]) -> String {
     blake3::hash(data).to_hex().to_string()
 }
 
+fn constant_time_eq_str(left: &str, right: &str) -> bool {
+    bool::from(left.as_bytes().ct_eq(right.as_bytes()))
+}
+
 pub fn sha256_hex(data: &[u8]) -> String {
     let mut d = Sha256::new();
     d.update(data);
@@ -409,7 +413,7 @@ pub fn pack(input: &Path, passphrase: &str, options: PackOptions) -> Result<Caps
         if let Some(ref sidecar) = options.aicx_sidecar {
             if !sidecar.manifest_hash.is_empty() {
                 let actual = hash_bytes(&prepared);
-                if actual != sidecar.manifest_hash {
+                if !constant_time_eq_str(&actual, &sidecar.manifest_hash) {
                     bail!(
                         "AICX sidecar manifest_hash mismatch: sidecar has {}, archive hashes to {}",
                         sidecar.manifest_hash,
@@ -717,8 +721,11 @@ pub fn verify_capsule(
                 .approval_tokens
                 .iter()
                 .filter(|t| {
-                    policy.approvers.contains(&t.approver_id)
-                        && t.bundle_id == capsule.public_header.bundle_id
+                    policy
+                        .approvers
+                        .iter()
+                        .any(|approver| constant_time_eq_str(approver, &t.approver_id))
+                        && constant_time_eq_str(&t.bundle_id, &capsule.public_header.bundle_id)
                         && t.verify().is_ok()
                         && t.check_ttl(policy.approval_ttl_seconds, now).is_ok()
                 })
