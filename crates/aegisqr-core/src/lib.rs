@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use argon2::Argon2;
@@ -13,14 +12,10 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tar::{Archive, Builder, Header};
 use walkdir::WalkDir;
 use zeroize::Zeroize;
-
-// Re-export sub-crate types so consumers only need `aegisqr-core` as a dep.
-pub use aegisqr_agent::{AicxSidecar, ArtifactCoordinate, ProvenanceRecord, SerializationProfile};
-pub use aegisqr_audit::{ApprovalToken, AuditAction, AuditEvent, AuditRecord};
-pub use aegisqr_policy::{EnterprisePolicy, RepoTarget, RepoType};
 
 pub const AQR_MAGIC: &[u8; 4] = b"AQR1";
 pub const AQR_VERSION: u32 = 1;
@@ -117,7 +112,7 @@ pub struct AgentIndex {
     pub input_schema_placeholder: Option<String>,
     pub risk_level: String,
     pub auto_execute_declaration: bool,
-    pub aicx_sidecar: Option<AicxSidecar>,
+    pub aicx_sidecar_reference_placeholder: Option<String>,
     pub toon_export_placeholder: Option<String>,
 }
 
@@ -166,16 +161,7 @@ pub struct Capsule {
     pub signature_block: SignatureBlock,
     pub chunk_table: Vec<ChunkEntry>,
     pub recovery_metadata_placeholder: Option<String>,
-    /// Enterprise approval and routing policy.  `None` means no approval gate.
-    #[serde(default)]
-    pub enterprise_policy: Option<EnterprisePolicy>,
-    /// Chronological audit trail accumulated across the capsule's lifecycle.
-    #[serde(default)]
-    pub audit_log: Vec<AuditRecord>,
-    /// Approval tokens endorsing this capsule.  Each token carries its own
-    /// Ed25519 signature and is independent of the capsule's primary signature.
-    #[serde(default)]
-    pub approval_tokens: Vec<ApprovalToken>,
+    pub audit_metadata_placeholder: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,7 +190,7 @@ impl TrustStore {
     pub fn is_trusted(&self, signer_id: &str, public_key: &[u8]) -> bool {
         self.trusted_signers
             .get(signer_id)
-            .map(|k| k == public_key)
+            .map(|k| bool::from(k.as_slice().ct_eq(public_key)))
             .unwrap_or(false)
     }
 }
@@ -331,6 +317,18 @@ pub fn verify_signature(capsule: &Capsule) -> Result<()> {
     let key = VerifyingKey::from_bytes(capsule.signature_block.public_key.as_slice().try_into()?)?;
     let sig = Signature::from_slice(&capsule.signature_block.signature)?;
     key.verify(&payload, &sig)?;
+    validate_signature_expiration(&capsule.signature_block.expiration)?;
+    Ok(())
+}
+
+fn validate_signature_expiration(expiration: &Option<String>) -> Result<()> {
+    if let Some(expiration) = expiration {
+        let expiration_ts = parse_timestamp_secs(expiration)
+            .with_context(|| format!("invalid signature expiration: {expiration}"))?;
+        if current_timestamp_secs() >= expiration_ts {
+            bail!("signature expired at {expiration}");
+        }
+    }
     Ok(())
 }
 
@@ -354,11 +352,6 @@ pub struct PackOptions {
     pub auto_execute_capable: bool,
     pub auto_execute_requested: bool,
     pub payload_type: Option<PayloadType>,
-    /// Optional AICX sidecar to embed in the capsule's `agent_index`.
-    ///
-    /// When provided for an `AicxArchive` payload, AegisQR validates the
-    /// sidecar's `manifest_hash` against the archive bytes before sealing.
-    pub aicx_sidecar: Option<AicxSidecar>,
 }
 
 impl Default for PackOptions {
@@ -369,7 +362,6 @@ impl Default for PackOptions {
             auto_execute_capable: false,
             auto_execute_requested: false,
             payload_type: None,
-            aicx_sidecar: None,
         }
     }
 }
@@ -400,25 +392,6 @@ pub fn pack(input: &Path, passphrase: &str, options: PackOptions) -> Result<Caps
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "payload".into());
     let prepared = prepare_payload(input, &payload_type)?;
-
-    // If an AICX sidecar is provided, validate its manifest_hash against the
-    // archive bytes before sealing.  This ensures the sidecar and the packed
-    // payload are consistent without AegisQR needing to parse archive internals.
-    if payload_type == PayloadType::AicxArchive {
-        if let Some(ref sidecar) = options.aicx_sidecar {
-            if !sidecar.manifest_hash.is_empty() {
-                let actual = hash_bytes(&prepared);
-                if actual != sidecar.manifest_hash {
-                    bail!(
-                        "AICX sidecar manifest_hash mismatch: sidecar has {}, archive hashes to {}",
-                        sidecar.manifest_hash,
-                        actual
-                    );
-                }
-            }
-        }
-    }
-
     let compressed = compress(&prepared, options.compression.clone())?;
 
     let bundle_id =
@@ -429,14 +402,6 @@ pub fn pack(input: &Path, passphrase: &str, options: PackOptions) -> Result<Caps
     let (salt, nonce, ciphertext, payload_hash) =
         encrypt_payload(passphrase, &bundle_id, &policy, &compressed)?;
     let encrypted_hash = hash_bytes(&ciphertext);
-
-    let pack_event = AuditEvent {
-        timestamp: created_at.clone(),
-        actor: "local".into(),
-        action: AuditAction::Pack,
-        result: "ok".into(),
-        notes: None,
-    };
 
     let mut capsule = Capsule {
         public_header: PublicHeader {
@@ -470,7 +435,7 @@ pub fn pack(input: &Path, passphrase: &str, options: PackOptions) -> Result<Caps
             input_schema_placeholder: Some("future-input-schema".into()),
             risk_level: "medium".into(),
             auto_execute_declaration,
-            aicx_sidecar: options.aicx_sidecar,
+            aicx_sidecar_reference_placeholder: Some("future-aicx-sidecar".into()),
             toon_export_placeholder: Some("future-toon-export".into()),
         },
         semantic_index_placeholder: Some("future-semantic-index".into()),
@@ -496,11 +461,7 @@ pub fn pack(input: &Path, passphrase: &str, options: PackOptions) -> Result<Caps
         },
         chunk_table: vec![],
         recovery_metadata_placeholder: Some("future-recovery-metadata".into()),
-        enterprise_policy: None,
-        audit_log: vec![AuditRecord {
-            events: vec![pack_event],
-        }],
-        approval_tokens: vec![],
+        audit_metadata_placeholder: Some("future-audit-metadata".into()),
     };
 
     capsule.chunk_table = build_chunk_table(&capsule.payload_section.ciphertext, 1024);
@@ -706,31 +667,6 @@ pub fn verify_capsule(
             bail!("chunk hash mismatch");
         }
     }
-
-    // Enterprise approval gate: require the minimum number of valid approval
-    // tokens from authorised approvers before allowing the capsule through.
-    if let Some(ref policy) = capsule.enterprise_policy {
-        if policy.approval_required {
-            let now = unix_now();
-            let valid = capsule
-                .approval_tokens
-                .iter()
-                .filter(|t| {
-                    policy.approvers.contains(&t.approver_id)
-                        && t.bundle_id == capsule.public_header.bundle_id
-                        && t.verify().is_ok()
-                        && t.check_ttl(policy.approval_ttl_seconds, now).is_ok()
-                })
-                .count();
-            if valid < policy.min_approvals as usize {
-                bail!(
-                    "insufficient approvals: {valid} valid, {} required",
-                    policy.min_approvals
-                );
-            }
-        }
-    }
-
     Ok(())
 }
 
@@ -795,9 +731,7 @@ fn restore_tar(bytes: &[u8], out_dir: &Path, force_stage: bool) -> Result<()> {
         let mut file = file?;
         let path = file.path()?;
         let rel = path.as_ref();
-        validate_relative(rel)?;
-
-        let target = out_dir.join(rel);
+        let target = safe_join(out_dir, rel)?;
         if file.header().entry_type().is_symlink() || file.header().entry_type().is_hard_link() {
             bail!("symlink escape is blocked");
         }
@@ -1016,120 +950,34 @@ pub fn deny_execution_message(policy: &ClientPolicy, auto_execute_requested: boo
     }
 }
 
-// ─── Inspection ──────────────────────────────────────────────────────────────
-
-/// A lightweight summary of enterprise policy suitable for inspection output.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EnterprisePolicySummary {
-    pub approval_required: bool,
-    pub min_approvals: u8,
-    /// Number of authorised approvers listed in the policy.
-    pub approvers_count: usize,
-    pub repo_target: Option<RepoTarget>,
-}
-
-/// Public-facing inspection report for a capsule — no decryption required.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CapsuleInspection {
-    pub public_header: PublicHeader,
-    pub aicx_sidecar: Option<AicxSidecar>,
-    pub enterprise_policy: Option<EnterprisePolicySummary>,
-    /// Number of approval tokens currently embedded in the capsule.
-    pub approval_count: usize,
-    /// Total number of audit events across all audit records.
-    pub audit_event_count: usize,
-}
-
-/// Returns a rich inspection report without decrypting the capsule payload.
-pub fn inspect_full(path: &Path) -> Result<CapsuleInspection> {
-    let capsule = read_capsule_file(path)?;
-    Ok(CapsuleInspection {
-        aicx_sidecar: capsule.agent_index.aicx_sidecar,
-        enterprise_policy: capsule.enterprise_policy.map(|p| EnterprisePolicySummary {
-            approval_required: p.approval_required,
-            min_approvals: p.min_approvals,
-            approvers_count: p.approvers.len(),
-            repo_target: p.repo_target,
-        }),
-        approval_count: capsule.approval_tokens.len(),
-        audit_event_count: capsule.audit_log.iter().map(|r| r.events.len()).sum(),
-        public_header: capsule.public_header,
-    })
-}
-
-// ─── Approval ────────────────────────────────────────────────────────────────
-
-/// Creates a signed [`ApprovalToken`] using the provided raw 32-byte Ed25519 seed.
-///
-/// The signing payload is `"{bundle_id}|{approver_id}|{approved_at}"`.
-pub fn create_approval_token(
-    bundle_id: &str,
-    approver_id: &str,
-    signing_key_seed: &[u8],
-) -> Result<ApprovalToken> {
-    let seed: &[u8; 32] = signing_key_seed
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("signing key seed must be exactly 32 bytes"))?;
-    let signing_key = SigningKey::from_bytes(seed);
-    let approved_at = chrono_like_now();
-    let mut token = ApprovalToken {
-        bundle_id: bundle_id.to_string(),
-        approver_id: approver_id.to_string(),
-        approved_at,
-        signature: vec![],
-        public_key: signing_key.verifying_key().to_bytes().to_vec(),
-    };
-    let sig = signing_key.sign(&token.signing_payload());
-    token.signature = sig.to_bytes().to_vec();
-    Ok(token)
-}
-
-/// Appends a signed approval token to an existing capsule file.
-///
-/// The original Ed25519 signature covering the capsule's core content is
-/// unaffected: approval tokens are stored separately and carry their own
-/// signatures.  Writes the result to `out` (which may equal `path`).
-pub fn approve_capsule(
-    path: &Path,
-    approver_id: &str,
-    signing_key_seed: &[u8],
-    out: &Path,
-) -> Result<ApprovalToken> {
-    let mut capsule = read_capsule_file(path)?;
-    let token = create_approval_token(
-        &capsule.public_header.bundle_id.clone(),
-        approver_id,
-        signing_key_seed,
-    )?;
-    capsule.approval_tokens.push(token.clone());
-    capsule.audit_log.push(AuditRecord {
-        events: vec![AuditEvent {
-            timestamp: chrono_like_now(),
-            actor: approver_id.to_string(),
-            action: AuditAction::Approve,
-            result: "ok".into(),
-            notes: Some(format!(
-                "approval token issued for bundle {}",
-                capsule.public_header.bundle_id
-            )),
-        }],
-    });
-    write_capsule_file(out, &capsule)?;
-    Ok(token)
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
 fn chrono_like_now() -> String {
-    let ts = unix_now();
-    format!("{ts}")
+    current_timestamp_secs().to_string()
 }
 
-fn unix_now() -> u64 {
+fn current_timestamp_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+const MAX_SIGNATURE_EXPIRATION_SECS: u64 = 253_402_300_799;
+
+fn parse_timestamp_secs(ts: &str) -> Result<u64> {
+    if ts.is_empty() {
+        bail!("timestamp cannot be empty");
+    }
+    if ts.len() > 20 {
+        bail!("timestamp exceeds supported range");
+    }
+
+    let parsed: u64 = ts.parse()?;
+    if parsed > MAX_SIGNATURE_EXPIRATION_SECS {
+        bail!("timestamp exceeds supported range");
+    }
+
+    Ok(parsed)
 }
 
 #[cfg(test)]
@@ -1137,6 +985,15 @@ mod tests {
     use super::*;
     use std::path::Path;
     use tempfile::tempdir;
+
+    fn resign_capsule_for_test(capsule: &mut Capsule) {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let payload = signature_payload(capsule).unwrap();
+        let sig = signing_key.sign(&payload);
+        capsule.signature_block.signer_id = "test-signer".into();
+        capsule.signature_block.public_key = signing_key.verifying_key().to_bytes().to_vec();
+        capsule.signature_block.signature = sig.to_bytes().to_vec();
+    }
 
     #[test]
     fn public_header_creation() {
@@ -1196,6 +1053,53 @@ mod tests {
         let mut tampered = capsule.clone();
         tampered.public_header.profile = "changed".into();
         assert!(verify_signature(&tampered).is_err());
+    }
+
+    #[test]
+    fn expired_signature_is_rejected_for_verify_and_restore() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("a.txt");
+        fs::write(&src, b"abc").unwrap();
+        let bundle = dir.path().join("expired.aqr");
+        pack_to_file(&src, &bundle, "pw", PackOptions::default()).unwrap();
+
+        let mut capsule = read_capsule_file(&bundle).unwrap();
+        capsule.signature_block.expiration = Some("0".into());
+        resign_capsule_for_test(&mut capsule);
+        write_capsule_file(&bundle, &capsule).unwrap();
+
+        assert!(verify_signature(&capsule).is_err());
+        assert!(verify_capsule(&bundle, None, false).is_err());
+        assert!(unpack_capsule(&bundle, &dir.path().join("out"), "pw").is_err());
+    }
+
+    #[test]
+    fn invalid_signature_expiration_is_rejected() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("a.txt");
+        fs::write(&src, b"abc").unwrap();
+        let mut capsule = pack(&src, "pw", PackOptions::default()).unwrap();
+        capsule.signature_block.expiration = Some("not-a-timestamp".into());
+        resign_capsule_for_test(&mut capsule);
+
+        assert!(verify_signature(&capsule).is_err());
+    }
+
+    #[test]
+    fn out_of_range_signature_expiration_is_rejected() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("a.txt");
+        fs::write(&src, b"abc").unwrap();
+        let mut capsule = pack(&src, "pw", PackOptions::default()).unwrap();
+        capsule.signature_block.expiration = Some((MAX_SIGNATURE_EXPIRATION_SECS + 1).to_string());
+        resign_capsule_for_test(&mut capsule);
+
+        assert!(verify_signature(&capsule).is_err());
+    }
+
+    #[test]
+    fn excessively_long_signature_expiration_is_rejected() {
+        assert!(parse_timestamp_secs("999999999999999999999").is_err());
     }
 
     #[test]
