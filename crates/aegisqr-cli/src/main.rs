@@ -1,24 +1,27 @@
 use std::fs;
-use std::path::PathBuf;
+use std::io::{self, IsTerminal, Read};
+use std::path::{Path, PathBuf};
 
 use aegisqr_core::{
-    approve_capsule, deny_execution_message, export_qr_packets, import_qr_packets, inspect_full,
-    pack_to_file, stage_capsule, unpack_capsule, verify_capsule, AicxSidecar, ClientPolicy,
-    CompressionProfile, PackOptions, PayloadType, TrustStore,
+    deny_execution_message, export_qr_packets, import_qr_packets, pack_to_file,
+    stage_capsule, unpack_capsule, verify_capsule, ClientPolicy, CompressionProfile, PackOptions,
+    PayloadType, TrustStore,
 };
-use aegisqr_repo::{
-    validate_handoff_package, AuthConfig, AuthType, HandoffPackage, HandoffState,
-    RepositoryCoordinates,
-};
-use anyhow::{bail, Result};
-use clap::{Args, Parser, Subcommand};
-use rand::rngs::OsRng;
-use rand::RngCore;
+use anyhow::{bail, Context, Result};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use zeroize::Zeroize;
+
+const PASSPHRASE_ENV_VAR: &str = "AEGISQR_PASSPHRASE";
+const MAX_STDIN_PASSPHRASE_BYTES: u64 = 4096;
+const PASSPHRASE_HELP: &str =
+    "Passphrases are never accepted on the command line. By default, AegisQR prompts with hidden \
+input. For automation, pipe the passphrase over stdin and pass --passphrase-stdin. \
+AEGISQR_PASSPHRASE is rejected because environment variables may be exposed to other processes.";
 
 #[derive(Parser, Debug)]
 #[command(name = "aegisqr")]
-#[command(about = "AegisQR secure QR-native capsule CLI — AICX/Enterprise edition")]
+#[command(about = "AegisQR secure QR-native capsule CLI")]
+#[command(after_help = PASSPHRASE_HELP)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -26,6 +29,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    #[command(after_help = PASSPHRASE_HELP)]
     Pack(PackArgs),
     Inspect {
         bundle: PathBuf,
@@ -37,26 +41,14 @@ enum Commands {
         #[arg(long)]
         trust_store: Option<PathBuf>,
     },
+    #[command(after_help = PASSPHRASE_HELP)]
     Unpack(UnpackArgs),
+    #[command(after_help = PASSPHRASE_HELP)]
     Stage(UnpackArgs),
     Export(ExportArgs),
     Import(ImportArgs),
-    /// Append a signed approval token to a capsule.
-    ///
-    /// The signing key file must contain a hex-encoded 32-byte Ed25519 seed
-    /// (64 ASCII hex characters).  Generate one with `aegisqr keygen`.
-    Approve(ApproveArgs),
-    /// Validate and prepare a handoff package for the Artifactory/Nexus plugin.
-    ///
-    /// Reads the capsule, extracts the embedded AICX sidecar, validates all
-    /// approval tokens, and writes a `handoff-package.json` for the plugin.
-    Handoff(HandoffArgs),
-    /// Generate a new Ed25519 signing key (hex-encoded 32-byte seed).
-    Keygen {
-        /// Output file path for the hex-encoded key seed.
-        #[arg(long)]
-        out: PathBuf,
-    },
+    PackRetail(Box<PackRetailArgs>),
+    VerifyRetail(VerifyRetailArgs),
 }
 
 #[derive(Args, Debug)]
@@ -64,23 +56,68 @@ struct PackArgs {
     input: PathBuf,
     #[arg(long)]
     out: PathBuf,
-    #[arg(long)]
-    passphrase: String,
     #[arg(long, default_value = "balanced")]
     compression: String,
     #[arg(long)]
     aicx: bool,
-    /// Path to an AICX sidecar JSON file to embed in the capsule.
-    ///
-    /// Required when `--aicx` is set and sidecar validation is desired.
-    /// The sidecar's `manifest_hash` must match the BLAKE3 hash of the
-    /// `.aicx` archive if the field is non-empty.
     #[arg(long)]
     aicx_sidecar: Option<PathBuf>,
+    #[arg(long, default_value_t = false)]
+    aicx_strict: bool,
     #[arg(long, default_value_t = false)]
     auto_execute_capable: bool,
     #[arg(long, default_value_t = false)]
     auto_execute_requested: bool,
+    #[command(flatten)]
+    passphrase: PassphraseArgs,
+}
+
+#[derive(Args, Debug)]
+struct PackRetailArgs {
+    #[arg(long)]
+    retailer_id: String,
+    #[arg(long)]
+    sku: String,
+    #[arg(long)]
+    upc: Option<String>,
+    #[arg(long)]
+    store_id: String,
+    #[arg(long)]
+    aisle: Option<String>,
+    #[arg(long)]
+    bay: Option<String>,
+    #[arg(long)]
+    shelf: Option<String>,
+    #[arg(long)]
+    campaign_id: Option<String>,
+    #[arg(long)]
+    experience_id: Option<String>,
+    #[arg(long)]
+    role: Option<String>,
+    #[arg(long, default_value_t = 1)]
+    label_version: u32,
+    #[arg(long, default_value_t = 0)]
+    expires_in_secs: u64,
+    #[arg(long)]
+    fallback_url_id: Option<String>,
+    #[arg(long)]
+    privkey: String,
+    #[arg(long)]
+    kid: String,
+    #[arg(long)]
+    out: PathBuf,
+}
+
+#[derive(Args, Debug)]
+struct VerifyRetailArgs {
+    #[arg(long)]
+    url_file: PathBuf,
+    #[arg(long)]
+    pubkey: String,
+    #[arg(long)]
+    kid: String,
+    #[arg(long, default_value_t = false)]
+    authenticated_associate: bool,
 }
 
 #[derive(Args, Debug)]
@@ -88,8 +125,26 @@ struct UnpackArgs {
     bundle: PathBuf,
     #[arg(long)]
     out: PathBuf,
-    #[arg(long)]
-    passphrase: String,
+    #[command(flatten)]
+    passphrase: PassphraseArgs,
+}
+
+#[derive(Args, Debug, Default)]
+struct PassphraseArgs {
+    #[arg(
+        long,
+        help = "Read the passphrase from stdin instead of prompting",
+        long_help = "Read the passphrase from stdin instead of prompting. \
+If this flag is not set, AegisQR prompts with hidden input when run interactively. \
+AEGISQR_PASSPHRASE is intentionally rejected because environment variables may be exposed to other processes."
+    )]
+    passphrase_stdin: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PassphraseSource {
+    Prompt,
+    Stdin,
 }
 
 #[derive(Subcommand, Debug)]
@@ -126,63 +181,25 @@ enum ImportSub {
     },
 }
 
-#[derive(Args, Debug)]
-struct ApproveArgs {
-    bundle: PathBuf,
-    /// Approver identity string (must match an entry in the capsule's
-    /// `enterprise_policy.approvers` to count towards the minimum).
-    #[arg(long)]
-    signer_id: String,
-    /// Path to the hex-encoded 32-byte Ed25519 signing key seed file.
-    #[arg(long)]
-    signing_key: PathBuf,
-    /// Output path.  Defaults to overwriting the input bundle.
-    #[arg(long)]
-    out: Option<PathBuf>,
-}
-
-#[derive(Args, Debug)]
-struct HandoffArgs {
-    bundle: PathBuf,
-    /// Path to a JSON file containing `RepositoryCoordinates`.
-    #[arg(long)]
-    target_coords: PathBuf,
-    /// Output path for the handoff-package.json.
-    #[arg(long, default_value = "handoff-package.json")]
-    out: PathBuf,
-    /// Validate only; do not write the handoff package.
-    #[arg(long, default_value_t = false)]
-    dry_run: bool,
-    #[arg(long)]
-    trust_store: Option<PathBuf>,
-    /// Preferred serialization profile (`json` or `toon`).
-    #[arg(long, default_value = "json")]
-    serialization_profile: String,
-}
-
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = parse_cli()?;
     match cli.command {
         Commands::Pack(args) => {
-            let compression = parse_compression(&args.compression);
-            let payload_type = if args.aicx {
+            let compression = parse_compression(&args.compression)?;
+            let is_aicx = args.aicx || args.aicx_sidecar.is_some();
+            let payload_type = if is_aicx {
                 Some(PayloadType::AicxArchive)
             } else {
                 None
             };
-            let aicx_sidecar = if let Some(path) = args.aicx_sidecar {
-                let bytes = fs::read(&path)?;
-                Some(serde_json::from_slice::<AicxSidecar>(&bytes)?)
-            } else {
-                None
-            };
-            let mut passphrase = args.passphrase;
+            let mut passphrase = resolve_passphrase(&args.passphrase, true)?;
             let options = PackOptions {
                 compression,
                 auto_execute_capable: args.auto_execute_capable,
                 auto_execute_requested: args.auto_execute_requested,
                 payload_type,
-                aicx_sidecar,
+                aicx_sidecar_path: args.aicx_sidecar.clone(),
+                aicx_strict: args.aicx_strict,
                 ..PackOptions::default()
             };
             let cap = pack_to_file(&args.input, &args.out, &passphrase, options)?;
@@ -190,12 +207,10 @@ fn main() -> Result<()> {
             println!("Packed {} -> {}", args.input.display(), args.out.display());
             println!("bundle_id={}", cap.public_header.bundle_id);
         }
-
         Commands::Inspect { bundle } => {
-            let report = inspect_full(&bundle)?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            let capsule = aegisqr_core::read_capsule_file(&bundle)?;
+            println!("{}", serde_json::to_string_pretty(&capsule)?);
         }
-
         Commands::Verify {
             bundle,
             strict_trust,
@@ -210,22 +225,19 @@ fn main() -> Result<()> {
             verify_capsule(&bundle, trust.as_ref(), strict_trust)?;
             println!("Verification succeeded");
         }
-
         Commands::Unpack(args) => {
-            let mut passphrase = args.passphrase;
+            let mut passphrase = resolve_passphrase(&args.passphrase, false)?;
             unpack_capsule(&args.bundle, &args.out, &passphrase)?;
             passphrase.zeroize();
             println!("Unpacked to {}", args.out.display());
         }
-
         Commands::Stage(args) => {
-            let mut passphrase = args.passphrase;
+            let mut passphrase = resolve_passphrase(&args.passphrase, false)?;
             stage_capsule(&args.bundle, &args.out, &passphrase)?;
             passphrase.zeroize();
             println!("Staged to {}", args.out.display());
             println!("{}", deny_execution_message(&ClientPolicy::default(), true));
         }
-
         Commands::Export(args) => match args.sub {
             ExportSub::Qr {
                 bundle,
@@ -237,120 +249,266 @@ fn main() -> Result<()> {
                 println!("Exported QR packets to {}", out.display());
             }
         },
-
         Commands::Import(args) => match args.sub {
             ImportSub::Qr { qr_dir, out } => {
                 import_qr_packets(&qr_dir, &out)?;
                 println!("Imported QR packets -> {}", out.display());
             }
         },
-
-        Commands::Approve(args) => {
-            let seed = load_signing_key(&args.signing_key)?;
-            let out = args.out.as_ref().unwrap_or(&args.bundle);
-            let token = approve_capsule(&args.bundle, &args.signer_id, &seed, out)?;
-            println!("Approval token appended");
-            println!("approver_id={}", token.approver_id);
-            println!("approved_at={}", token.approved_at);
-            println!("bundle_id={}", token.bundle_id);
-            println!("Written to {}", out.display());
-        }
-
-        Commands::Handoff(args) => {
-            let coords_bytes = fs::read(&args.target_coords)?;
-            let target_coords = serde_json::from_slice::<RepositoryCoordinates>(&coords_bytes)?;
-
-            let trust = if let Some(path) = args.trust_store {
-                let bytes = fs::read(path)?;
-                Some(serde_json::from_slice::<TrustStore>(&bytes)?)
+        Commands::PackRetail(args) => {
+            let privkey_bytes = hex::decode(&args.privkey).context("invalid hex private key")?;
+            let issued_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
+            let expires_at = if args.expires_in_secs > 0 {
+                issued_at + args.expires_in_secs
             } else {
-                None
+                0
             };
-
-            // Extract AICX sidecar from the capsule agent_index.
-            let capsule = aegisqr_core::read_capsule_file(&args.bundle)?;
-            let aicx_sidecar = capsule.agent_index.aicx_sidecar.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "no AICX sidecar embedded in capsule — pack with --aicx-sidecar first"
-                )
-            })?;
-
-            let serialization_profile = parse_serialization_profile(&args.serialization_profile);
-
-            let pkg = HandoffPackage {
-                capsule_path: args.bundle.clone(),
-                aicx_sidecar,
-                audit_log: capsule.audit_log,
-                approval_tokens: vec![], // external tokens; capsule tokens are read internally
-                target_coords,
-                auth_config: Some(AuthConfig {
-                    auth_type: AuthType::Bearer,
-                    token: None, // plugin fills this from its credential store
-                }),
-                serialization_profile,
+            let payload = aegisqr_core::RetailPayload {
+                retailer_id: args.retailer_id,
+                sku: args.sku,
+                upc: args.upc,
+                store_id: args.store_id,
+                aisle: args.aisle,
+                bay: args.bay,
+                shelf: args.shelf,
+                campaign_id: args.campaign_id,
+                experience_id: args.experience_id,
+                role: args.role,
+                label_version: args.label_version,
+                issued_at,
+                expires_at,
+                fallback_url_id: args.fallback_url_id,
             };
-
-            let result = validate_handoff_package(&pkg, trust.as_ref())?;
-            let state_json = serde_json::to_string_pretty(&result.event)?;
-            println!("{state_json}");
-
-            match &result.state {
-                HandoffState::Approved => {
-                    println!("\nHandoff state: APPROVED — ready for plugin ingestion")
-                }
-                HandoffState::AwaitingApproval => println!("\nHandoff state: AWAITING APPROVAL"),
-                HandoffState::Failed(msg) => bail!("Handoff validation failed: {msg}"),
-                other => println!("\nHandoff state: {}", serde_json::to_string(other)?),
+            let token = aegisqr_core::sign_retail_payload(payload, &privkey_bytes, args.kid)?;
+            let url = format!("https://tractor-supply.com/qr/product?p={}", token);
+            if let Some(parent) = args.out.parent() {
+                fs::create_dir_all(parent)?;
             }
-
-            if !args.dry_run {
-                let json = serde_json::to_string_pretty(&pkg)?;
-                fs::write(&args.out, json)?;
-                println!("Written to {}", args.out.display());
-            }
+            fs::write(&args.out, url.as_bytes())?;
+            println!("Created retail signed deep-link at: {}", args.out.display());
+            println!("URL: {}", url);
         }
-
-        Commands::Keygen { out } => {
-            let mut seed = [0u8; 32];
-            OsRng.fill_bytes(&mut seed);
-            let hex_key = hex::encode(seed);
-            fs::write(&out, &hex_key)?;
-            println!("Ed25519 key seed written to {}", out.display());
-            println!("Keep this file secret — it is your signing credential.");
+        Commands::VerifyRetail(args) => {
+            let url_str =
+                fs::read_to_string(&args.url_file).context("failed to read retail URL file")?;
+            let url = url_str.trim();
+            let query_part = url
+                .split("?p=")
+                .nth(1)
+                .or_else(|| url.split("&p=").nth(1))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("URL does not contain signed payload query parameter 'p'")
+                })?;
+            let pubkey_bytes = hex::decode(&args.pubkey).context("invalid hex public key")?;
+            let mut trust_store = aegisqr_core::TrustStore::default();
+            trust_store.add_signer(args.kid, pubkey_bytes);
+            let current_time_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs();
+            let payload =
+                aegisqr_core::verify_retail_payload(query_part, &trust_store, current_time_secs)?;
+            aegisqr_core::authorize_retail_action(&payload, args.authenticated_associate)?;
+            println!("Verification Succeeded!");
+            println!("Payload: {:?}", payload);
         }
     }
 
     Ok(())
 }
 
-fn parse_compression(s: &str) -> CompressionProfile {
-    match s {
-        "none" => CompressionProfile::None,
-        "fast" => CompressionProfile::Fast,
-        "balanced" => CompressionProfile::Balanced,
-        "qr-basic" => CompressionProfile::QrBasic,
-        _ => CompressionProfile::Balanced,
+fn parse_cli() -> Result<Cli> {
+    let command = if let Some(bin_name) = std::env::args_os()
+        .next()
+        .as_deref()
+        .and_then(|arg0| Path::new(arg0).file_name())
+        .and_then(|name| name.to_str())
+    {
+        Cli::command().bin_name(bin_name.to_string())
+    } else {
+        Cli::command()
+    };
+    Ok(Cli::from_arg_matches(&command.get_matches())?)
+}
+
+fn resolve_passphrase(args: &PassphraseArgs, confirm: bool) -> Result<String> {
+    match select_passphrase_source(
+        args,
+        std::env::var_os(PASSPHRASE_ENV_VAR).is_some(),
+        io::stdin().is_terminal(),
+    )? {
+        PassphraseSource::Prompt => {
+            if confirm {
+                read_passphrase_with_confirmation("Passphrase", "Confirm passphrase")
+            } else {
+                read_passphrase_prompt("Passphrase")
+            }
+        }
+        PassphraseSource::Stdin => read_passphrase_from_stdin(),
     }
 }
 
-fn parse_serialization_profile(s: &str) -> aegisqr_repo::SerializationProfile {
-    match s.to_ascii_lowercase().as_str() {
-        "toon" => aegisqr_repo::SerializationProfile::Toon,
-        _ => aegisqr_repo::SerializationProfile::Json,
-    }
-}
-
-/// Reads a hex-encoded 32-byte Ed25519 seed from `path`.
-fn load_signing_key(path: &std::path::Path) -> Result<Vec<u8>> {
-    let raw = fs::read_to_string(path)?;
-    let trimmed = raw.trim();
-    let bytes = hex::decode(trimmed)
-        .map_err(|e| anyhow::anyhow!("signing key file is not valid hex: {e}"))?;
-    if bytes.len() != 32 {
+fn select_passphrase_source(
+    args: &PassphraseArgs,
+    env_present: bool,
+    stdin_is_terminal: bool,
+) -> Result<PassphraseSource> {
+    if args.passphrase_stdin {
+        Ok(PassphraseSource::Stdin)
+    } else if env_present {
         bail!(
-            "signing key must be a 32-byte Ed25519 seed ({} bytes after hex decode, expected 32)",
-            bytes.len()
+            "{PASSPHRASE_ENV_VAR} is not supported because environment variables may be exposed to other processes; pipe the passphrase over stdin with --passphrase-stdin"
+        )
+    } else if stdin_is_terminal {
+        Ok(PassphraseSource::Prompt)
+    } else {
+        bail!("passphrase required: rerun interactively to be prompted or pass --passphrase-stdin")
+    }
+}
+
+fn read_passphrase_prompt(prompt: &str) -> Result<String> {
+    ensure_non_empty(
+        rpassword::prompt_password(format!("{prompt}: "))?,
+        "prompted passphrase",
+    )
+}
+
+fn read_passphrase_with_confirmation(prompt: &str, confirm_prompt: &str) -> Result<String> {
+    let mut passphrase = read_passphrase_prompt(prompt)?;
+    let mut passphrase_confirm = read_passphrase_prompt(confirm_prompt)?;
+    if passphrase != passphrase_confirm {
+        passphrase.zeroize();
+        passphrase_confirm.zeroize();
+        bail!("passphrases do not match");
+    }
+    passphrase_confirm.zeroize();
+    Ok(passphrase)
+}
+
+fn read_passphrase_from_stdin() -> Result<String> {
+    let mut passphrase = String::new();
+    io::stdin()
+        .lock()
+        .take(MAX_STDIN_PASSPHRASE_BYTES + 1)
+        .read_to_string(&mut passphrase)
+        .context("failed to read passphrase from stdin")?;
+    if passphrase.len() as u64 > MAX_STDIN_PASSPHRASE_BYTES {
+        passphrase.zeroize();
+        bail!(
+            "stdin passphrase exceeds {MAX_STDIN_PASSPHRASE_BYTES} bytes; passphrases must stay reasonably small"
         );
     }
-    Ok(bytes)
+    ensure_non_empty(
+        normalize_passphrase_from_stdin(passphrase),
+        "stdin passphrase",
+    )
+}
+
+fn normalize_passphrase_from_stdin(mut passphrase: String) -> String {
+    let normalized = passphrase.trim_end_matches(['\r', '\n']).to_string();
+    passphrase.zeroize();
+    normalized
+}
+
+fn parse_compression(value: &str) -> Result<CompressionProfile> {
+    match value {
+        "none" => Ok(CompressionProfile::None),
+        "fast" => Ok(CompressionProfile::Fast),
+        "balanced" => Ok(CompressionProfile::Balanced),
+        "qr-basic" => Ok(CompressionProfile::QrBasic),
+        other => bail!("invalid compression profile: {other}"),
+    }
+}
+
+fn ensure_non_empty(mut passphrase: String, source: &str) -> Result<String> {
+    if passphrase.is_empty() {
+        passphrase.zeroize();
+        bail!("{source} cannot be empty");
+    }
+    Ok(passphrase)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stdin_flag_takes_priority() {
+        let args = PassphraseArgs {
+            passphrase_stdin: true,
+        };
+        assert_eq!(
+            select_passphrase_source(&args, true, true).unwrap(),
+            PassphraseSource::Stdin
+        );
+    }
+
+    #[test]
+    fn env_is_rejected_due_to_exposure_risk() {
+        let args = PassphraseArgs::default();
+        let err = select_passphrase_source(&args, true, false).unwrap_err();
+        assert!(err.to_string().contains(PASSPHRASE_ENV_VAR));
+        assert!(err.to_string().contains("--passphrase-stdin"));
+    }
+
+    #[test]
+    fn prompt_is_used_interactively_without_automation_input() {
+        let args = PassphraseArgs::default();
+        assert_eq!(
+            select_passphrase_source(&args, false, true).unwrap(),
+            PassphraseSource::Prompt
+        );
+    }
+
+    #[test]
+    fn non_interactive_runs_require_stdin() {
+        let args = PassphraseArgs::default();
+        assert!(select_passphrase_source(&args, false, false)
+            .unwrap_err()
+            .to_string()
+            .contains("--passphrase-stdin"));
+    }
+
+    #[test]
+    fn stdin_normalization_strips_all_trailing_newlines() {
+        assert_eq!(
+            normalize_passphrase_from_stdin("secret\r\n".to_string()),
+            "secret"
+        );
+        assert_eq!(
+            normalize_passphrase_from_stdin("secret\n\n".to_string()),
+            "secret"
+        );
+        assert_eq!(
+            normalize_passphrase_from_stdin("secret\n".to_string()),
+            "secret"
+        );
+        assert_eq!(
+            normalize_passphrase_from_stdin("secret".to_string()),
+            "secret"
+        );
+    }
+
+    #[test]
+    fn invalid_compression_profile_is_rejected() {
+        assert!(parse_compression("definitely-not-real")
+            .unwrap_err()
+            .to_string()
+            .contains("invalid compression profile"));
+    }
+
+    #[test]
+    fn old_passphrase_flag_is_rejected() {
+        assert!(Cli::try_parse_from([
+            "aegisqr",
+            "pack",
+            "input.txt",
+            "--out",
+            "bundle.aqr",
+            "--passphrase",
+            "secret",
+        ])
+        .is_err());
+    }
 }

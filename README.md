@@ -12,11 +12,12 @@ AegisQR is a **secure, encrypted, signed, and compressed QR-native capsule forma
 4. [Where to use AegisQR](#where-to-use-aegisqr)
 5. [Security model and defaults](#security-model-and-defaults)
 6. [Build and install](#build-and-install)
-7. [CLI reference](#cli-reference)
-8. [Interactive UI](#interactive-ui-lightweight-alternative-to-the-cli)
-9. [Examples](#examples)
-10. [AQR1 capsule format overview](#aqr1-capsule-format-overview)
-11. [Project status and roadmap](#project-status-and-roadmap)
+7. [Quick start](#quick-start)
+8. [CLI reference](#cli-reference)
+9. [Interactive UI](#interactive-ui-lightweight-alternative-to-the-cli)
+10. [Examples](#examples)
+11. [AQR1 capsule format overview](#aqr1-capsule-format-overview)
+12. [Project status and roadmap](#project-status-and-roadmap)
 
 ---
 
@@ -75,10 +76,11 @@ Do **not** use AegisQR today for:
 
 | Context | Recommended entry point |
 |---|---|
-| CI/CD pipeline, scripted workflows | `aegisqr-cli` binary (`cargo run -p aegisqr-cli`) |
+| CI/CD pipeline, scripted workflows | Source-built `aegisqr-cli` (`cargo run -p aegisqr-cli -- ...` or `cargo install --path crates/aegisqr-cli --locked`) |
+| Portable or removable-media workflows | Portable installer command `aegisqr` (`./packaging/install.sh` or `./packaging/install.ps1`) |
 | Desktop interactive use | `aegisqr-ui` interactive app (`cargo run -p aegisqr-ui`) |
 | Rust application integration | `aegisqr-core` crate (add as a dependency) |
-| Air-gap workstation (pack side) | CLI `pack` + `export qr` → print QR sheets |
+| Air-gap workstation (pack side) | CLI `pack` + `export qr` -> print QR sheets |
 | Air-gap workstation (receive side) | CLI `import qr` + `verify` + `unpack` / `stage` |
 | Secure hand-off kiosk | `inspect` (no passphrase needed) to show public header |
 
@@ -104,6 +106,25 @@ Do **not** use AegisQR today for:
 
 - Rust 1.78+ (stable toolchain)
 - `cargo` in `$PATH`
+- A working C toolchain / linker (`cc`) for crates with native build steps such as `zstd-sys`
+
+### Install Rust and toolchain components
+
+If you do not already have Rust:
+
+```bash
+curl https://sh.rustup.rs -sSf | sh -s -- -y --profile default
+. "$HOME/.cargo/env"
+rustup toolchain install stable --component rustfmt --component clippy
+rustup default stable
+```
+
+On Debian / Ubuntu hosts, install a native build toolchain too:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential pkg-config
+```
 
 ### Build everything
 
@@ -116,16 +137,106 @@ cargo build --workspace
 ### Run the test suite
 
 ```bash
-cargo test --workspace
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
 ```
 
-### Install the CLI globally
+Run the scenario-focused tests that exercise the end-to-end flows:
 
 ```bash
-cargo install --path crates/aegisqr-cli
+cargo test -p aegisqr-core scenario_ --locked
 ```
 
-After installation the `aegisqr` binary is on your `$PATH`.
+Run a single named test:
+
+```bash
+cargo test -p aegisqr-core scenario_roundtrip_file_and_qr_reconstruct -- --exact
+```
+
+### Run the CLI without installing
+
+```bash
+cargo run -p aegisqr-cli -- --help
+cargo run -p aegisqr-cli -- pack ./input.txt --out ./output.aqr
+```
+
+### Install the source-built CLI globally
+
+```bash
+cargo install --path crates/aegisqr-cli --locked
+aegisqr-cli --help
+```
+
+After `cargo install`, the executable name is **`aegisqr-cli`**.
+
+### Install a portable bundle
+
+Portable bundles are intended for systems where you do not want to build from source, including removable-media installs and air-gapped handoff workflows.
+
+Remote archive installs must use HTTPS. For direct archive URLs outside the GitHub release flow, provide `--archive-sha256` / `-ArchiveSha256` unless you intentionally bypass verification with the installer skip-checksum flag.
+
+```bash
+./packaging/install.sh
+./packaging/install.sh --version v0.1.0
+./packaging/install.sh --install-dir /media/USB/aegisqr --bin-dir /media/USB/bin
+./packaging/install.sh --archive https://example.invalid/aegisqr-x86_64-unknown-linux-gnu.tar.gz --archive-sha256 <sha256> --install-dir /tmp/aegisqr
+```
+
+Windows hosts can use:
+
+```powershell
+./packaging/install.ps1
+./packaging/install.ps1 -Version v0.1.0
+./packaging/install.ps1 -Archive https://example.invalid/aegisqr-x86_64-pc-windows-msvc.zip -ArchiveSha256 <sha256>
+```
+
+After the portable installers run, the command name is **`aegisqr`**.
+
+See [`docs/portable-install.md`](docs/portable-install.md) for archive-based installation and portable media layouts.
+
+### CI and minimal-host testing
+
+The repository CI runs `cargo fmt`, `cargo clippy`, `cargo test`, the scenario-focused core tests, and a release build with locked dependencies.
+
+On minimal hosts such as Ubuntu Core, source builds still need a user-provided C linker/toolchain. If you do not want to provision that locally, use the portable bundles or rely on GitHub Actions runners for full validation.
+
+---
+
+## Quick start
+
+Choose the command name that matches how you installed AegisQR:
+
+| Installation path | Command to run |
+|---|---|
+| `cargo install --path crates/aegisqr-cli --locked` | `aegisqr-cli` |
+| Portable installer (`install.sh` / `install.ps1`) | `aegisqr` |
+| No install, run from source | `cargo run -p aegisqr-cli --` |
+
+The examples below use **`aegisqr`** for readability. If you installed from Cargo, replace `aegisqr` with `aegisqr-cli`. If you are running directly from the repo, prefix commands with `cargo run -p aegisqr-cli --`.
+
+Create a capsule, inspect it, verify it, and restore it:
+
+```bash
+# Pack a file into a signed, encrypted capsule
+aegisqr pack report.pdf --out report.aqr
+
+# Read the public header without a passphrase
+aegisqr inspect report.aqr
+
+# Verify signature and ciphertext chunk integrity
+aegisqr verify report.aqr
+
+# Restore the payload
+aegisqr unpack report.aqr --out ./restored
+```
+
+For automation, use stdin for the passphrase:
+
+```bash
+printf '%s' "$AQR_PASSPHRASE" | aegisqr pack ./dist --out release.aqr --passphrase-stdin
+printf '%s' "$AQR_PASSPHRASE" | aegisqr unpack release.aqr --out ./restored --passphrase-stdin
+```
 
 ---
 
@@ -137,6 +248,8 @@ All commands follow the pattern:
 aegisqr <subcommand> [options]
 ```
 
+If you installed with Cargo, substitute `aegisqr-cli`. If you are running from source, substitute `cargo run -p aegisqr-cli --`.
+
 Run `aegisqr --help` or `aegisqr <subcommand> --help` for up-to-date flag descriptions.
 
 ---
@@ -144,7 +257,7 @@ Run `aegisqr --help` or `aegisqr <subcommand> --help` for up-to-date flag descri
 ### `pack` — create a capsule
 
 ```bash
-aegisqr pack <INPUT> --out <BUNDLE.aqr> --passphrase <PASS> [OPTIONS]
+aegisqr pack <INPUT> --out <BUNDLE.aqr> [--passphrase-stdin] [OPTIONS]
 ```
 
 | Option | Default | Description |
@@ -153,18 +266,20 @@ aegisqr pack <INPUT> --out <BUNDLE.aqr> --passphrase <PASS> [OPTIONS]
 | `--aicx` | off | Treat `INPUT` as an AICX archive (`payload_type: aicx-archive`) |
 | `--auto-execute-capable` | off | Mark the capsule as capable of auto-execution (metadata only) |
 | `--auto-execute-requested` | off | Declare intent to auto-execute (requires `--auto-execute-capable`) |
+| `--passphrase-stdin` | off | Read the passphrase from stdin instead of prompting |
 
 `INPUT` can be a single file **or** a directory (packed as a tar archive).
+By default, the CLI prompts for a hidden passphrase and asks for confirmation. For automation, pipe the passphrase over stdin with `--passphrase-stdin`. `AEGISQR_PASSPHRASE` is intentionally rejected because environment variables may be visible to other processes.
 
 ```bash
-# Pack a single file
-aegisqr pack report.pdf --out report.aqr --passphrase "hunter2"
+# Pack a single file (interactive hidden prompt)
+aegisqr pack report.pdf --out report.aqr
 
-# Pack a directory
-aegisqr pack ./my-project --out project.aqr --passphrase "hunter2" --compression qr-basic
+# Pack a directory from CI using stdin
+printf '%s' "$CI_PASSPHRASE" | aegisqr pack ./my-project --out project.aqr --compression qr-basic --passphrase-stdin
 
-# Pack an AICX archive
-aegisqr pack model.aicx --out model.aqr --passphrase "hunter2" --aicx
+# Pack an AICX archive with stdin
+printf '%s' "$MODEL_PASSPHRASE" | aegisqr pack model.aicx --out model.aqr --aicx --passphrase-stdin
 ```
 
 ---
@@ -207,15 +322,16 @@ aegisqr verify report.aqr --strict-trust --trust-store /etc/aegisqr/trust.json
 ### `unpack` — decrypt and restore payload
 
 ```bash
-aegisqr unpack <BUNDLE.aqr> --out <DIR> --passphrase <PASS>
+aegisqr unpack <BUNDLE.aqr> --out <DIR> [--passphrase-stdin]
 ```
 
 - Verifies the signature before decrypting.
 - Extracts all files to `DIR`.
 - Files with executable extensions go to `DIR/quarantine/`.
+- Prompts for a hidden passphrase by default; automation should pipe the passphrase over stdin with `--passphrase-stdin`.
 
 ```bash
-aegisqr unpack report.aqr --out ./restored --passphrase "hunter2"
+aegisqr unpack report.aqr --out ./restored
 ```
 
 ---
@@ -223,13 +339,13 @@ aegisqr unpack report.aqr --out ./restored --passphrase "hunter2"
 ### `stage` — quarantine-only restore
 
 ```bash
-aegisqr stage <BUNDLE.aqr> --out <DIR> --passphrase <PASS>
+aegisqr stage <BUNDLE.aqr> --out <DIR> [--passphrase-stdin]
 ```
 
 Identical to `unpack` except **all** files go to `DIR/quarantine/` regardless of type. Use this for maximum caution when the origin of the capsule is unknown.
 
 ```bash
-aegisqr stage suspicious.aqr --out ./staging --passphrase "hunter2"
+printf '%s' "$HOST_PASSPHRASE" | aegisqr stage suspicious.aqr --out ./staging --passphrase-stdin
 ```
 
 ---
@@ -269,11 +385,13 @@ aegisqr import qr ./qr-packets --out recovered.aqr
 
 ## Interactive UI (lightweight alternative to the CLI)
 
-The `aegisqr-ui` crate provides a guided terminal menu for all operations. It prompts for paths, passphrases (with echo-off), and options interactively — no flags to remember.
+The `aegisqr-ui` crate provides a guided terminal menu for all operations. It prompts for paths, passphrases (with echo-off), and options interactively — no flags to remember. The CLI now follows the same hidden-prompt default and reserves stdin / environment variables for automation.
 
 ```bash
 cargo run -p aegisqr-ui
 ```
+
+The UI is interactive; it does not provide a useful `--help` mode.
 
 On startup you will see:
 
@@ -303,7 +421,7 @@ Each flow prompts for only the inputs required for that operation. Passphrases a
 Pack a sensitive document on the sending machine:
 
 ```bash
-aegisqr pack secret.pdf --out secret.aqr --passphrase "correct-horse-battery"
+aegisqr pack secret.pdf --out secret.aqr
 aegisqr export qr secret.aqr --out ./qr --packet-size 500 --png
 # Print the PNG sheets or display them on screen
 ```
@@ -314,7 +432,7 @@ Reassemble and restore on the receiving machine:
 # Scan QR images into a directory, then:
 aegisqr import qr ./scanned-qr --out secret.aqr
 aegisqr verify secret.aqr
-aegisqr unpack secret.aqr --out ./received --passphrase "correct-horse-battery"
+printf '%s' "$RECEIVER_PASSPHRASE" | aegisqr unpack secret.aqr --out ./received --passphrase-stdin
 ```
 
 ---
@@ -325,7 +443,7 @@ A CI pipeline packs and the receiving host verifies against a pinned trust store
 
 ```bash
 # Pack (CI side)
-aegisqr pack ./dist --out release.aqr --passphrase "$CI_PASSPHRASE" --compression qr-basic
+printf '%s' "$CI_PASSPHRASE" | aegisqr pack ./dist --out release.aqr --compression qr-basic --passphrase-stdin
 
 # Inspect without decrypting (routing / SIEM)
 aegisqr inspect release.aqr
@@ -334,7 +452,7 @@ aegisqr inspect release.aqr
 aegisqr verify release.aqr --strict-trust --trust-store /etc/aegisqr/corp-trust.json
 
 # Stage first for human review
-aegisqr stage release.aqr --out /var/staging --passphrase "$HOST_PASSPHRASE"
+printf '%s' "$HOST_PASSPHRASE" | aegisqr stage release.aqr --out /var/staging --passphrase-stdin
 # Review quarantine/ contents, then manually promote
 ```
 
@@ -345,7 +463,7 @@ aegisqr stage release.aqr --out /var/staging --passphrase "$HOST_PASSPHRASE"
 When the origin of a capsule is not fully trusted, always stage instead of unpack:
 
 ```bash
-aegisqr stage unknown.aqr --out ./sandbox --passphrase "mypass"
+printf '%s' "$HOST_PASSPHRASE" | aegisqr stage unknown.aqr --out ./sandbox --passphrase-stdin
 # All files land in ./sandbox/quarantine/
 # Manually inspect before promoting any executable
 ```
@@ -416,4 +534,3 @@ MVP is implemented with:
 - Unit tests, integration tests, and CI
 
 See [`PLAN.md`](PLAN.md) for the phased roadmap (AICX deeper integration, hardware keys, animated QR, mobile scanner, WASM runtime, Reed-Solomon recovery, reproducible builds).
-

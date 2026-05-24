@@ -7,10 +7,8 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-hex.workspace = true
-rand.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 aegisqr-core = { path = "../aegisqr-core" }
-aegisqr-repo = { path = "../aegisqr-repo" }
+rpassword.workspace = true
 zeroize.workspace = true
+hex.workspace = true

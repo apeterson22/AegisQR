@@ -6,9 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-hex.workspace = true
 aegisqr-core = { path = "../aegisqr-core" }
-aegisqr-repo = { path = "../aegisqr-repo" }
 rpassword = "7.4.0"
 serde_json = { workspace = true }
 zeroize = { workspace = true }

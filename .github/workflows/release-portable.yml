@@ -1,0 +1,185 @@
+name: release-portable
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-portable-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-portable:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive_name: aegisqr-x86_64-unknown-linux-gnu.tar.gz
+            binary_name: aegisqr-cli
+            platform: linux
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive_name: aegisqr-x86_64-apple-darwin.tar.gz
+            binary_name: aegisqr-cli
+            platform: macos
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive_name: aegisqr-x86_64-pc-windows-msvc.zip
+            binary_name: aegisqr-cli.exe
+            platform: windows
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fetch
+        run: cargo fetch --locked
+
+      - name: build release binary
+        run: cargo build -p aegisqr-cli --release --locked
+
+      - name: assemble portable bundle (unix)
+        if: matrix.platform != 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME}"
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            VERSION="snapshot-${GITHUB_SHA::7}"
+          fi
+          BUNDLE_DIR="dist/aegisqr-${{ matrix.target }}"
+          mkdir -p "${BUNDLE_DIR}"
+          cp "target/release/${{ matrix.binary_name }}" "${BUNDLE_DIR}/aegisqr"
+          cp packaging/trust-store.example.json "${BUNDLE_DIR}/trust-store.example.json"
+          python3 - <<'PY'
+          import json, os, pathlib
+          bundle = pathlib.Path(os.environ["BUNDLE_DIR"])
+          manifest = {
+              "name": "aegisqr",
+              "format_version": 1,
+              "version": os.environ["VERSION"],
+              "target": os.environ["TARGET"],
+              "platform": os.environ["PLATFORM"],
+              "archive_name": os.environ["ARCHIVE_NAME"],
+              "bundle_contents": [
+                  "aegisqr",
+                  "manifest.json",
+                  "trust-store.example.json",
+              ],
+          }
+          (bundle / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+          PY
+          tar -C dist -czf "dist/${{ matrix.archive_name }}" "aegisqr-${{ matrix.target }}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "dist/${{ matrix.archive_name }}" > "dist/checksums-${{ matrix.target }}.txt"
+          else
+            shasum -a 256 "dist/${{ matrix.archive_name }}" > "dist/checksums-${{ matrix.target }}.txt"
+          fi
+        env:
+          BUNDLE_DIR: dist/aegisqr-${{ matrix.target }}
+          VERSION: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
+          ARCHIVE_NAME: ${{ matrix.archive_name }}
+
+      - name: smoke test installer (unix)
+        if: matrix.platform != 'windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          CHECKSUM="$(awk '{print $1}' "dist/checksums-${{ matrix.target }}.txt")"
+          ./packaging/install.sh \
+            --archive "dist/${{ matrix.archive_name }}" \
+            --archive-sha256 "${CHECKSUM}" \
+            --install-dir "$PWD/dist/test-install-${{ matrix.target }}" \
+            --bin-dir "$PWD/dist/test-bin-${{ matrix.target }}"
+          "$PWD/dist/test-bin-${{ matrix.target }}/aegisqr" --help >/dev/null
+
+      - name: assemble portable bundle (windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $version = "${env:GITHUB_REF_NAME}"
+          if ("${env:GITHUB_REF_TYPE}" -ne "tag") {
+            $version = "snapshot-$($env:GITHUB_SHA.Substring(0,7))"
+          }
+          $bundleDir = "dist/aegisqr-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path $bundleDir -Force | Out-Null
+          Copy-Item "target/release/${{ matrix.binary_name }}" "$bundleDir/aegisqr.exe"
+          Copy-Item "packaging/trust-store.example.json" "$bundleDir/trust-store.example.json"
+          $manifest = @{
+            name = "aegisqr"
+            format_version = 1
+            version = $version
+            target = "${{ matrix.target }}"
+            platform = "${{ matrix.platform }}"
+            archive_name = "${{ matrix.archive_name }}"
+            bundle_contents = @(
+              "aegisqr.exe",
+              "manifest.json",
+              "trust-store.example.json"
+            )
+          } | ConvertTo-Json -Depth 4
+          Set-Content -Path "$bundleDir/manifest.json" -Value $manifest
+          Compress-Archive -Path "$bundleDir/*" -DestinationPath "dist/${{ matrix.archive_name }}" -Force
+          $hash = (Get-FileHash "dist/${{ matrix.archive_name }}" -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -Path "dist/checksums-${{ matrix.target }}.txt" -Value "$hash  ${{ matrix.archive_name }}"
+
+      - name: smoke test installer (windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $checksum = (Get-Content "dist/checksums-${{ matrix.target }}.txt").Split()[0]
+          ./packaging/install.ps1 `
+            -Archive "dist/${{ matrix.archive_name }}" `
+            -ArchiveSha256 $checksum `
+            -InstallDir "$PWD/dist/test-install-${{ matrix.target }}" `
+            -BinDir "$PWD/dist/test-bin-${{ matrix.target }}"
+          & "$PWD/dist/test-bin-${{ matrix.target }}/aegisqr.exe" --help | Out-Null
+
+      - name: copy release manifest
+        shell: bash
+        run: cp "dist/aegisqr-${{ matrix.target }}/manifest.json" "dist/manifest-${{ matrix.target }}.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: portable-${{ matrix.target }}
+          path: dist/*
+
+  publish-release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build-portable
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: portable-*
+          path: dist
+          merge-multiple: true
+
+      - name: assemble release checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat dist/checksums-*.txt > dist/SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
