@@ -1953,7 +1953,7 @@ mod tests {
         trust_store.add_signer("key-1", pubkey_bytes);
 
         let payload = RetailPayload {
-            retailer_id: "tractor-supply".into(),
+            retailer_id: "aegisqr".into(),
             sku: "12345".into(),
             upc: Some("54321".into()),
             store_id: "store-0452".into(),

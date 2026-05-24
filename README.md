@@ -575,7 +575,7 @@ AegisQR supports generating ultra-compact, offline-verifiable, signed universal 
 Generate a signed HTTPS Universal Link containing a CBOR-packed, Ed25519-signed payload:
 ```bash
 aegisqr pack-retail \
-  --retailer-id "tractor-supply" \
+  --retailer-id "aegisqr" \
   --sku "1002345" \
   --store-id "store-0452" \
   --role "associate" \

@@ -104,6 +104,8 @@ struct PackRetailArgs {
     privkey: String,
     #[arg(long)]
     kid: String,
+    #[arg(long, default_value = "https://aegisqr.app/qr/product")]
+    base_url: String,
     #[arg(long)]
     out: PathBuf,
 }
@@ -282,7 +284,9 @@ fn main() -> Result<()> {
                 fallback_url_id: args.fallback_url_id,
             };
             let token = aegisqr_core::sign_retail_payload(payload, &privkey_bytes, args.kid)?;
-            let url = format!("https://tractor-supply.com/qr/product?p={}", token);
+            let base_url = args.base_url.trim_end_matches('/');
+            let separator = if base_url.contains('?') { "&p=" } else { "?p=" };
+            let url = format!("{}{}{}", base_url, separator, token);
             if let Some(parent) = args.out.parent() {
                 fs::create_dir_all(parent)?;
             }
