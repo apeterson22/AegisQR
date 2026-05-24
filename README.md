@@ -583,7 +583,7 @@ aegisqr pack-retail \
   --kid "key-1" \
   --out signed_link.txt
 ```
-*Options:* Use `--expires-in-secs <seconds>` to set a temporary, self-expiring link signature.
+*Options:* Use `--expires-in-secs <seconds>` to set a temporary, self-expiring link signature. Use `--base-url <URL>` to supply a custom enterprise domain or path (defaults to `https://aegisqr.app/qr/product`). Existing query parameters on custom base URLs are dynamically parsed and merged.
 
 ##### Verify a Retail Link Offline (`verify-retail`)
 Verify the link's signature offline against a local trust store:
