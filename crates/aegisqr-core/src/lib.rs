@@ -721,11 +721,14 @@ pub fn verify_capsule(
                 .approval_tokens
                 .iter()
                 .filter(|t| {
-                    policy
-                        .approvers
-                        .iter()
-                        .any(|approver| constant_time_eq_str(approver, &t.approver_id))
-                        && constant_time_eq_str(&t.bundle_id, &capsule.public_header.bundle_id)
+                    let approver_matches = policy.approvers.iter().fold(false, |acc, approver| {
+                        acc | constant_time_eq_str(approver, &t.approver_id)
+                    });
+                    let bundle_matches =
+                        constant_time_eq_str(&t.bundle_id, &capsule.public_header.bundle_id);
+                    let identity_matches = approver_matches & bundle_matches;
+
+                    identity_matches
                         && t.verify().is_ok()
                         && t.check_ttl(policy.approval_ttl_seconds, now).is_ok()
                 })
