@@ -516,9 +516,85 @@ See [`SPEC.md`](SPEC.md) for the complete schema.
 
 ---
 
-## AegisQR vs AICX
+## AegisQR and AICX Integration
 
-AICX is a separate repository. AegisQR includes an integration interface (`payload_type: aicx-archive`) so future versions can wrap external AICX archives, but does not implement AICX internally.
+AegisQR integrates with the sibling **AICX** (AI-native adaptive compression and semantic archive) library via loose, contract-based integration. AegisQR acts as a secure courier wrapping compressed `.aicx` archives, validating their metadata sidecars, and encoding key contexts into signed, offline-capable deep links.
+
+### 1. AICX Sidecar Ingestion
+
+#### When to Use
+Use AICX sidecar ingestion when you want to wrap a deterministic, compressed `.aicx` archive into a secure AegisQR capsule (`.aqr`) while enriching the capsule's unencrypted `AgentIndex` with archive intelligence (such as risk hints, entrypoints, and query hints) to let edge AI nodes or agents inspect the archive's metadata without requiring the decryption passphrase.
+
+#### How to Use
+Ingest a sidecar explicitly using the `--aicx-sidecar` flag during capsule packing:
+```bash
+aegisqr pack payload.aicx \
+  --aicx-sidecar payload.sidecar.json \
+  --out payload.aqr \
+  --passphrase-stdin <<< "your-secret-passphrase"
+```
+
+##### Strict Mode Validation (`--aicx-strict`)
+To enforce strict, fail-closed production validation, pass `--aicx-strict`:
+```bash
+aegisqr pack payload.aicx \
+  --aicx-sidecar payload.sidecar.json \
+  --out payload.aqr \
+  --aicx-strict \
+  --passphrase-stdin <<< "your-secret-passphrase"
+```
+In strict mode, AegisQR will immediately abort packing if:
+* The sidecar is missing or malformed.
+* The `.aicx` payload BLAKE3/SHA-256 hash does not match the sidecar's `archive_digest`.
+* The sidecar schema version is unsupported (only version `2` is supported).
+* The digest algorithm is unsupported (only `blake3` and `sha256` are supported).
+
+##### Developer Autodiscovery
+If you pass the `--aicx` flag without an explicit `--aicx-sidecar` path, AegisQR automatically searches for sidecars next to the input file in this order:
+1. `<payload>.aicx.sidecar.json`
+2. `<payload>.sidecar.json`
+3. `<payload>.aicx.json`
+4. `<payload>.aicx.sidecar.cbor`
+5. `<payload>.sidecar.cbor`
+
+If no companion sidecar is found, it falls back to a warning and packages in reduced, digest-only mode.
+
+---
+
+### 2. Retail Signed Deep-Linking
+
+AegisQR supports generating ultra-compact, offline-verifiable, signed universal deep-linking profiles for shelf labels, catalog items, and retail workflows.
+
+#### When to Use
+* **Customer shelf labels:** Scans decode to a secure, signed HTTPS Universal Link. Standard phone camera apps can open the fallback URL directly in a browser without needing AegisQR installed.
+* **Associate inventory/planogram tasks:** The store device's application intercepts the universal link, validates the Ed25519 signature offline, parses the `role: "associate"` payload, and safely routes the associate to restricted workflows.
+
+#### How to Use
+
+##### Pack a Retail Signed Link (`pack-retail`)
+Generate a signed HTTPS Universal Link containing a CBOR-packed, Ed25519-signed payload:
+```bash
+aegisqr pack-retail \
+  --retailer-id "tractor-supply" \
+  --sku "1002345" \
+  --store-id "store-0452" \
+  --role "associate" \
+  --privkey "0707070707070707070707070707070707070707070707070707070707070707" \
+  --kid "key-1" \
+  --out signed_link.txt
+```
+*Options:* Use `--expires-in-secs <seconds>` to set a temporary, self-expiring link signature.
+
+##### Verify a Retail Link Offline (`verify-retail`)
+Verify the link's signature offline against a local trust store:
+```bash
+aegisqr verify-retail \
+  --url-file signed_link.txt \
+  --pubkey "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c" \
+  --kid "key-1" \
+  --authenticated-associate
+```
+*Note:* The `--authenticated-associate` flag simulates a verified associate session. Signed retail deep-links with `role: "associate"` will fail closed with an `Access Denied` error unless this session verification is supplied.
 
 ---
 
