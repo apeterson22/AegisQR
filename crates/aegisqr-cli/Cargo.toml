@@ -11,6 +11,7 @@ hex.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+rpassword = "7.4.0"
 aegisqr-core = { path = "../aegisqr-core" }
 aegisqr-repo = { path = "../aegisqr-repo" }
 zeroize.workspace = true

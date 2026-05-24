@@ -44,6 +44,7 @@ dependencies = [
  "clap",
  "hex",
  "rand 0.8.6",
+ "rpassword",
  "serde",
  "serde_json",
  "zeroize",
