@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    runs-on: aegis-local
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

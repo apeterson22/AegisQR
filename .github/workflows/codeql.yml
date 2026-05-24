@@ -19,7 +19,7 @@ concurrency:
 
 jobs:
   analyze:
-    runs-on: ubuntu-latest
+    runs-on: aegis-local
     strategy:
       fail-fast: false
       matrix:
