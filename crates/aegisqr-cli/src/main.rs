@@ -3,9 +3,9 @@ use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 
 use aegisqr_core::{
-    deny_execution_message, export_qr_packets, import_qr_packets, pack_to_file,
-    stage_capsule, unpack_capsule, verify_capsule, ClientPolicy, CompressionProfile, PackOptions,
-    PayloadType, TrustStore,
+    deny_execution_message, export_qr_packets, import_qr_packets, pack_to_file, stage_capsule,
+    unpack_capsule, verify_capsule, ClientPolicy, CompressionProfile, PackOptions, PayloadType,
+    TrustStore,
 };
 use anyhow::{bail, Context, Result};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
