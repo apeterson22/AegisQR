@@ -2,6 +2,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 
+pub mod license;
+pub use license::*;
+
 use anyhow::{bail, Context, Result};
 use argon2::Argon2;
 use base64::Engine;

@@ -20,6 +20,7 @@ AEGISQR_PASSPHRASE is rejected because environment variables may be exposed to o
 
 #[derive(Parser, Debug)]
 #[command(name = "aegisqr")]
+#[command(version = "0.1.0-featured")]
 #[command(about = "AegisQR secure QR-native capsule CLI")]
 #[command(after_help = PASSPHRASE_HELP)]
 struct Cli {
@@ -49,6 +50,25 @@ enum Commands {
     Import(ImportArgs),
     PackRetail(Box<PackRetailArgs>),
     VerifyRetail(VerifyRetailArgs),
+    License {
+        #[command(subcommand)]
+        sub: LicenseSub,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum LicenseSub {
+    Status {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    Install {
+        path: PathBuf,
+    },
+    Show {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -120,6 +140,8 @@ struct VerifyRetailArgs {
     kid: String,
     #[arg(long, default_value_t = false)]
     authenticated_associate: bool,
+    #[arg(long, default_value_t = false)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -184,6 +206,11 @@ enum ImportSub {
 }
 
 fn main() -> Result<()> {
+    let current_time_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    aegisqr_core::license::handle_license_reminders(current_time_secs);
+
     let cli = parse_cli()?;
     match cli.command {
         Commands::Pack(args) => {
@@ -314,9 +341,105 @@ fn main() -> Result<()> {
             let payload =
                 aegisqr_core::verify_retail_payload(query_part, &trust_store, current_time_secs)?;
             aegisqr_core::authorize_retail_action(&payload, args.authenticated_associate)?;
-            println!("Verification Succeeded!");
-            println!("Payload: {:?}", payload);
+            if args.json {
+                let out_json = serde_json::json!({
+                    "verification": "succeeded",
+                    "payload": payload
+                });
+                println!("{}", serde_json::to_string_pretty(&out_json)?);
+            } else {
+                println!("Verification Succeeded!");
+                println!("Payload: {:?}", payload);
+            }
         }
+        Commands::License { sub } => match sub {
+            LicenseSub::Status { json } => {
+                let current_time_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs();
+                let status = aegisqr_core::license::verify_license_status(current_time_secs);
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&status)?);
+                } else {
+                    println!("License Status: {}", status.status.to_uppercase());
+                    if let Some(org) = status.organization {
+                        println!("Organization:   {}", org);
+                    }
+                    if let Some(tier) = status.tier {
+                        println!("Tier:           {}", tier);
+                    }
+                    if let Some(seats) = status.seats {
+                        println!("Seats:          {}", seats);
+                    }
+                    if let Some(expires) = status.expires_at {
+                        println!("Expires At:     {}", expires);
+                    }
+                    if let Some(rem) = status.days_remaining {
+                        println!("Days Remaining: {}", rem);
+                    }
+                }
+            }
+            LicenseSub::Install { path } => {
+                let bytes = fs::read(&path).context("failed to read source license file")?;
+                let lic: aegisqr_core::license::LicenseFile = serde_json::from_slice(&bytes)
+                    .context("invalid license file format")?;
+                aegisqr_core::license::check_license_integrity(&lic)
+                    .context("license integrity check failed (invalid signature or unknown key)")?;
+
+                let mut installed = false;
+                
+                // Try /etc/aegisqr
+                if fs::create_dir_all("/etc/aegisqr").is_ok() {
+                    if fs::write("/etc/aegisqr/license.aqlic", &bytes).is_ok() {
+                        installed = true;
+                        println!("Installed license to /etc/aegisqr/license.aqlic");
+                    }
+                }
+
+                if !installed {
+                    // Fallback to home folder
+                    if let Ok(home) = std::env::var("HOME") {
+                        let user_dir = format!("{}/.config/aegisqr", home);
+                        let user_path = format!("{}/license.aqlic", user_dir);
+                        fs::create_dir_all(&user_dir)?;
+                        fs::write(&user_path, &bytes)?;
+                        installed = true;
+                        println!("Installed license to {}", user_path);
+                    } else if let Ok(userprofile) = std::env::var("USERPROFILE") {
+                        let user_dir = format!("{}/.config/aegisqr", userprofile);
+                        let user_path = format!("{}/license.aqlic", user_dir);
+                        fs::create_dir_all(&user_dir)?;
+                        fs::write(&user_path, &bytes)?;
+                        installed = true;
+                        println!("Installed license to {}", user_path);
+                    }
+                }
+
+                if !installed {
+                    fs::write("./license.aqlic", &bytes)?;
+                    println!("Installed license to ./license.aqlic");
+                }
+            }
+            LicenseSub::Show { json } => {
+                let mut found = false;
+                for path in aegisqr_core::license::get_license_search_paths() {
+                    if path.is_file() {
+                        let content = fs::read_to_string(&path)?;
+                        if json {
+                            println!("{}", content.trim());
+                        } else {
+                            let lic: aegisqr_core::license::LicenseFile = serde_json::from_str(&content)?;
+                            println!("{:#?}", lic);
+                        }
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    bail!("No installed license found.");
+                }
+            }
+        },
     }
 
     Ok(())
