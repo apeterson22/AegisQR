@@ -3,12 +3,15 @@ name = "aegisqr-ui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+autobins = false
+
+[[bin]]
+name = "aegisqr-ui"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
-hex.workspace = true
 aegisqr-core = { path = "../aegisqr-core" }
-aegisqr-repo = { path = "../aegisqr-repo" }
 rpassword = "7.4.0"
 serde_json = { workspace = true }
 zeroize = { workspace = true }

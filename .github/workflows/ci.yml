@@ -8,19 +8,30 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   rust:
-    runs-on: ubuntu-latest
+    runs-on: aegis-local
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fetch
+        run: cargo fetch --locked
       - name: cargo fmt
         run: cargo fmt --all -- --check
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: cargo test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
       - name: scenario tests
-        run: cargo test -p aegisqr-core scenario_
+        run: cargo test -p aegisqr-core scenario_ --locked
       - name: release build
-        run: cargo build --workspace --release
+        run: cargo build --workspace --release --locked
+      - name: installer help
+        run: ./packaging/install.sh --help

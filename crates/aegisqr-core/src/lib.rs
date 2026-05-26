@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+
+pub mod license;
+pub use license::*;
 
 use anyhow::{bail, Context, Result};
 use argon2::Argon2;
@@ -13,14 +15,10 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tar::{Archive, Builder, Header};
 use walkdir::WalkDir;
 use zeroize::Zeroize;
-
-// Re-export sub-crate types so consumers only need `aegisqr-core` as a dep.
-pub use aegisqr_agent::{AicxSidecar, ArtifactCoordinate, ProvenanceRecord, SerializationProfile};
-pub use aegisqr_audit::{ApprovalToken, AuditAction, AuditEvent, AuditRecord};
-pub use aegisqr_policy::{EnterprisePolicy, RepoTarget, RepoType};
 
 pub const AQR_MAGIC: &[u8; 4] = b"AQR1";
 pub const AQR_VERSION: u32 = 1;
@@ -60,7 +58,7 @@ pub struct PublicHeader {
     pub requires_policy: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SectionEntry {
     pub section_id: String,
     pub offset: u64,
@@ -117,7 +115,9 @@ pub struct AgentIndex {
     pub input_schema_placeholder: Option<String>,
     pub risk_level: String,
     pub auto_execute_declaration: bool,
-    pub aicx_sidecar: Option<AicxSidecar>,
+    #[serde(rename = "aicx_sidecar", alias = "aicx_sidecar_reference_placeholder")]
+    pub aicx_sidecar_reference_placeholder: Option<String>,
+    #[serde(rename = "toon_export", alias = "toon_export_placeholder")]
     pub toon_export_placeholder: Option<String>,
 }
 
@@ -143,7 +143,7 @@ pub struct SignatureBlock {
     pub expiration: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChunkEntry {
     pub index: u32,
     pub hash: String,
@@ -157,6 +157,18 @@ pub struct Capsule {
     pub section_table: Vec<SectionEntry>,
     pub trust_block: Option<BTreeMap<String, String>>,
     pub policy_block: ClientPolicy,
+    #[serde(
+        rename = "enterprise_policy",
+        alias = "enterprise_policy_placeholder",
+        default
+    )]
+    pub enterprise_policy_placeholder: Option<serde_cbor::Value>,
+    #[serde(
+        rename = "approval_tokens",
+        alias = "approval_tokens_placeholder",
+        default
+    )]
+    pub approval_tokens_placeholder: Option<serde_cbor::Value>,
     pub key_wrap_table_placeholder: Option<String>,
     pub agent_index: AgentIndex,
     pub semantic_index_placeholder: Option<String>,
@@ -166,19 +178,10 @@ pub struct Capsule {
     pub signature_block: SignatureBlock,
     pub chunk_table: Vec<ChunkEntry>,
     pub recovery_metadata_placeholder: Option<String>,
-    /// Enterprise approval and routing policy.  `None` means no approval gate.
-    #[serde(default)]
-    pub enterprise_policy: Option<EnterprisePolicy>,
-    /// Chronological audit trail accumulated across the capsule's lifecycle.
-    #[serde(default)]
-    pub audit_log: Vec<AuditRecord>,
-    /// Approval tokens endorsing this capsule.  Each token carries its own
-    /// Ed25519 signature and is independent of the capsule's primary signature.
-    #[serde(default)]
-    pub approval_tokens: Vec<ApprovalToken>,
+    pub audit_metadata_placeholder: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct QrPacket {
     pub magic: String,
     pub version: u32,
@@ -204,9 +207,140 @@ impl TrustStore {
     pub fn is_trusted(&self, signer_id: &str, public_key: &[u8]) -> bool {
         self.trusted_signers
             .get(signer_id)
-            .map(|k| k == public_key)
+            .map(|k| bool::from(k.as_slice().ct_eq(public_key)))
             .unwrap_or(false)
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RetailProfileKind {
+    RetailPublicLinkV1,
+    RetailSignedLinkV1,
+    RetailAppContextV1,
+    RetailAssociateContextV1,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignedRetailPayload {
+    pub protected_header: RetailHeader,
+    pub payload: RetailPayload,
+    pub signature: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetailHeader {
+    pub v: u32,
+    pub alg: String,
+    pub kid: String,
+    pub typ: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetailPayload {
+    pub retailer_id: String,
+    pub sku: String,
+    pub upc: Option<String>,
+    pub store_id: String,
+    pub aisle: Option<String>,
+    pub bay: Option<String>,
+    pub shelf: Option<String>,
+    pub campaign_id: Option<String>,
+    pub experience_id: Option<String>,
+    pub role: Option<String>,
+    pub label_version: u32,
+    pub issued_at: u64,
+    pub expires_at: u64,
+    pub fallback_url_id: Option<String>,
+}
+
+pub fn sign_retail_payload(
+    payload: RetailPayload,
+    signing_key_bytes: &[u8],
+    kid: String,
+) -> Result<String> {
+    let signing_key = SigningKey::from_bytes(
+        signing_key_bytes
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("invalid signing key length (must be 32 bytes)"))?,
+    );
+    let header = RetailHeader {
+        v: 1,
+        alg: "Ed25519".into(),
+        kid,
+        typ: "retail-product-link".into(),
+    };
+    let header_bytes = deterministic_cbor(&header)?;
+    let payload_bytes = deterministic_cbor(&payload)?;
+
+    let mut sign_data = Vec::new();
+    sign_data.extend_from_slice(&header_bytes);
+    sign_data.extend_from_slice(&payload_bytes);
+
+    let signature = signing_key.sign(&sign_data).to_bytes().to_vec();
+    let envelope = SignedRetailPayload {
+        protected_header: header,
+        payload,
+        signature,
+    };
+    let envelope_bytes = deterministic_cbor(&envelope)?;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&envelope_bytes);
+    Ok(b64)
+}
+
+pub fn verify_retail_payload(
+    base64url_envelope: &str,
+    trust_store: &TrustStore,
+    current_time_secs: u64,
+) -> Result<RetailPayload> {
+    let envelope_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(base64url_envelope)
+        .context("invalid base64url retail envelope")?;
+    let envelope: SignedRetailPayload =
+        serde_cbor::from_slice(&envelope_bytes).context("invalid CBOR retail envelope")?;
+
+    let header = &envelope.protected_header;
+    if header.alg != "Ed25519" {
+        bail!("unsupported retail signature algorithm: {}", header.alg);
+    }
+    if header.typ != "retail-product-link" {
+        bail!("unsupported retail payload type: {}", header.typ);
+    }
+
+    let pubkey_bytes = trust_store
+        .trusted_signers
+        .get(&header.kid)
+        .ok_or_else(|| anyhow::anyhow!("unknown signing key ID (kid): {}", header.kid))?;
+
+    let payload = &envelope.payload;
+    if payload.expires_at > 0 && current_time_secs >= payload.expires_at {
+        bail!("retail signature has expired");
+    }
+
+    let header_bytes = deterministic_cbor(header)?;
+    let payload_bytes = deterministic_cbor(payload)?;
+    let mut sign_data = Vec::new();
+    sign_data.extend_from_slice(&header_bytes);
+    sign_data.extend_from_slice(&payload_bytes);
+
+    let ver_key = VerifyingKey::from_bytes(pubkey_bytes.as_slice().try_into()?)?;
+    let sig = Signature::from_slice(&envelope.signature)?;
+    ver_key
+        .verify(&sign_data, &sig)
+        .context("cryptographic retail signature verification failed")?;
+
+    Ok(payload.clone())
+}
+
+pub fn authorize_retail_action(
+    payload: &RetailPayload,
+    is_session_authenticated: bool,
+) -> Result<()> {
+    if let Some(ref role) = payload.role {
+        if role == "associate" && !is_session_authenticated {
+            bail!("Access Denied: Scanning associate role links requires an active, authenticated associate session.");
+        }
+    }
+    Ok(())
 }
 
 pub fn hash_bytes(data: &[u8]) -> String {
@@ -331,6 +465,18 @@ pub fn verify_signature(capsule: &Capsule) -> Result<()> {
     let key = VerifyingKey::from_bytes(capsule.signature_block.public_key.as_slice().try_into()?)?;
     let sig = Signature::from_slice(&capsule.signature_block.signature)?;
     key.verify(&payload, &sig)?;
+    validate_signature_expiration(&capsule.signature_block.expiration)?;
+    Ok(())
+}
+
+fn validate_signature_expiration(expiration: &Option<String>) -> Result<()> {
+    if let Some(expiration) = expiration {
+        let expiration_ts = parse_timestamp_secs(expiration)
+            .with_context(|| format!("invalid signature expiration: {expiration}"))?;
+        if current_timestamp_secs() >= expiration_ts {
+            bail!("signature expired at {expiration}");
+        }
+    }
     Ok(())
 }
 
@@ -348,17 +494,216 @@ fn signature_payload(capsule: &Capsule) -> Result<Vec<u8>> {
 }
 
 #[derive(Debug, Clone)]
+pub struct ParsedSidecarData {
+    pub manifest_digest: String,
+    pub sidecar_digest: String,
+    pub archive_digest: String,
+    pub risk_level: String,
+    pub risk_hints: Vec<String>,
+    pub entrypoint_candidate: Option<String>,
+    pub query_hints: Vec<String>,
+    pub sku_index_digest: Option<String>,
+    pub scoutai_context_digest: Option<String>,
+    pub recommended_profile: Option<String>,
+}
+
+pub fn resolve_sidecar(
+    payload_path: &Path,
+    sidecar_path_opt: Option<&Path>,
+) -> Result<Option<PathBuf>> {
+    if let Some(path) = sidecar_path_opt {
+        if path.exists() {
+            return Ok(Some(path.to_path_buf()));
+        } else {
+            bail!("specified sidecar path does not exist: {}", path.display());
+        }
+    }
+
+    let parent = payload_path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = payload_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if file_name.is_empty() {
+        return Ok(None);
+    }
+
+    let base_without_aicx = file_name.strip_suffix(".aicx").unwrap_or(file_name);
+
+    let candidates = vec![
+        parent.join(format!("{}.aicx.sidecar.json", base_without_aicx)),
+        parent.join(format!("{}.sidecar.json", base_without_aicx)),
+        parent.join(format!("{}.aicx.json", base_without_aicx)),
+        parent.join(format!("{}.aicx.sidecar.cbor", base_without_aicx)),
+        parent.join(format!("{}.sidecar.cbor", base_without_aicx)),
+    ];
+
+    for c in candidates {
+        if c.exists() {
+            return Ok(Some(c));
+        }
+    }
+
+    Ok(None)
+}
+
+pub fn parse_and_validate_sidecar(
+    sidecar_path: &Path,
+    payload_bytes: &[u8],
+    strict: bool,
+) -> Result<ParsedSidecarData> {
+    let sidecar_bytes = fs::read(sidecar_path)?;
+    let is_cbor = sidecar_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("cbor"))
+        .unwrap_or(false);
+
+    let root_val: serde_json::Value = if is_cbor {
+        serde_cbor::from_slice(&sidecar_bytes)
+            .map_err(|e| anyhow::anyhow!("failed to parse CBOR sidecar: {}", e))?
+    } else {
+        serde_json::from_slice(&sidecar_bytes)
+            .map_err(|e| anyhow::anyhow!("failed to parse JSON sidecar: {}", e))?
+    };
+
+    let (sidecar_val, manifest_digest, sidecar_digest, archive_digest) =
+        if root_val.get("sidecar").is_some() {
+            let sidecar = root_val.get("sidecar").unwrap().clone();
+            let m_dig = root_val
+                .get("manifest_digest")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let s_dig = root_val
+                .get("sidecar_digest")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let a_dig = root_val
+                .get("archive_digest")
+                .or_else(|| root_val.get("payload_digest"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            (sidecar, m_dig, s_dig, a_dig)
+        } else {
+            (root_val.clone(), None, None, None)
+        };
+
+    let computed_archive_hash = blake3::hash(payload_bytes).to_hex().to_string();
+
+    if let Some(ref ref_a_dig) = archive_digest {
+        if computed_archive_hash != *ref_a_dig {
+            if strict {
+                bail!(
+                    "archive_digest mismatch: computed {}, sidecar has {}",
+                    computed_archive_hash,
+                    ref_a_dig
+                );
+            } else {
+                println!(
+                    "Warning: archive_digest mismatch: computed {}, sidecar has {}",
+                    computed_archive_hash, ref_a_dig
+                );
+            }
+        }
+    } else if strict {
+        bail!("missing archive_digest when required in strict mode");
+    }
+
+    let entrypoint_candidate = sidecar_val
+        .get("entrypoint_candidates")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let risk_hints: Vec<String> = sidecar_val
+        .get("risk_hints")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let query_hints: Vec<String> = sidecar_val
+        .get("query_hints")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let risk_level = if risk_hints
+        .iter()
+        .any(|h| h.contains("workflow") || h.contains("private") || h.contains(".env"))
+    {
+        "high".to_string()
+    } else if !risk_hints.is_empty() {
+        "medium".to_string()
+    } else {
+        "low".to_string()
+    };
+
+    if let Some(manifest) = root_val.get("manifest") {
+        if let Some(version) = manifest.get("version") {
+            let v_u64 = version.as_u64().unwrap_or(0);
+            if v_u64 != 2 && strict {
+                bail!("unsupported sidecar version: {}", v_u64);
+            }
+        }
+        if let Some(hash_alg) = manifest.get("hash_algorithm") {
+            let alg_str = hash_alg.as_str().unwrap_or("");
+            if alg_str != "blake3" && alg_str != "sha256" && strict {
+                bail!("unsupported digest algorithm: {}", alg_str);
+            }
+        }
+    }
+
+    let sku_index_digest = root_val
+        .get("sku_index_digest")
+        .or_else(|| sidecar_val.get("sku_index_digest"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let scoutai_context_digest = root_val
+        .get("scoutai_context_digest")
+        .or_else(|| sidecar_val.get("scoutai_context_digest"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    let recommended_profile = root_val
+        .get("recommended_profile")
+        .or_else(|| sidecar_val.get("recommended_profile"))
+        .or_else(|| root_val.get("profile"))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+
+    Ok(ParsedSidecarData {
+        manifest_digest: manifest_digest.unwrap_or_default(),
+        sidecar_digest: sidecar_digest.unwrap_or_default(),
+        archive_digest: archive_digest.unwrap_or(computed_archive_hash),
+        risk_level,
+        risk_hints,
+        entrypoint_candidate,
+        query_hints,
+        sku_index_digest,
+        scoutai_context_digest,
+        recommended_profile,
+    })
+}
+
+#[derive(Debug, Clone)]
 pub struct PackOptions {
     pub profile: String,
     pub compression: CompressionProfile,
     pub auto_execute_capable: bool,
     pub auto_execute_requested: bool,
     pub payload_type: Option<PayloadType>,
-    /// Optional AICX sidecar to embed in the capsule's `agent_index`.
-    ///
-    /// When provided for an `AicxArchive` payload, AegisQR validates the
-    /// sidecar's `manifest_hash` against the archive bytes before sealing.
-    pub aicx_sidecar: Option<AicxSidecar>,
+    pub aicx_sidecar_path: Option<PathBuf>,
+    pub aicx_strict: bool,
 }
 
 impl Default for PackOptions {
@@ -369,7 +714,8 @@ impl Default for PackOptions {
             auto_execute_capable: false,
             auto_execute_requested: false,
             payload_type: None,
-            aicx_sidecar: None,
+            aicx_sidecar_path: None,
+            aicx_strict: false,
         }
     }
 }
@@ -401,22 +747,76 @@ pub fn pack(input: &Path, passphrase: &str, options: PackOptions) -> Result<Caps
         .unwrap_or_else(|| "payload".into());
     let prepared = prepare_payload(input, &payload_type)?;
 
-    // If an AICX sidecar is provided, validate its manifest_hash against the
-    // archive bytes before sealing.  This ensures the sidecar and the packed
-    // payload are consistent without AegisQR needing to parse archive internals.
-    if payload_type == PayloadType::AicxArchive {
-        if let Some(ref sidecar) = options.aicx_sidecar {
-            if !sidecar.manifest_hash.is_empty() {
-                let actual = hash_bytes(&prepared);
-                if actual != sidecar.manifest_hash {
-                    bail!(
-                        "AICX sidecar manifest_hash mismatch: sidecar has {}, archive hashes to {}",
-                        sidecar.manifest_hash,
-                        actual
-                    );
+    let is_aicx = payload_type == PayloadType::AicxArchive
+        || input
+            .extension()
+            .map(|s| s.eq_ignore_ascii_case("aicx"))
+            .unwrap_or(false);
+
+    let mut sidecar_ref: Option<String> = None;
+    let mut parsed_sidecar: Option<ParsedSidecarData> = None;
+
+    if is_aicx {
+        match resolve_sidecar(input, options.aicx_sidecar_path.as_deref()) {
+            Ok(Some(path)) => {
+                match parse_and_validate_sidecar(&path, &prepared, options.aicx_strict) {
+                    Ok(data) => {
+                        let ref_json = serde_json::json!({
+                            "aicx_archive_reference": data.archive_digest,
+                            "manifest_digest": data.manifest_digest,
+                            "sidecar_digest": data.sidecar_digest,
+                            "risk_level": data.risk_level,
+                            "risk_hints": data.risk_hints,
+                            "entrypoint_candidate": data.entrypoint_candidate,
+                            "query_hints": data.query_hints,
+                            "sku_index_digest": data.sku_index_digest,
+                            "scoutai_context_digest": data.scoutai_context_digest,
+                            "recommended_profile": data.recommended_profile,
+                        });
+                        sidecar_ref = Some(ref_json.to_string());
+                        parsed_sidecar = Some(data);
+                    }
+                    Err(e) => {
+                        if options.aicx_strict {
+                            return Err(e);
+                        } else {
+                            println!(
+                                "Warning: failed to parse/validate discovered sidecar: {}",
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                if options.aicx_strict {
+                    bail!("missing sidecar path when required in strict mode");
+                } else {
+                    println!("Warning: No AICX sidecar file discovered or specified. Falling back to digest-only mode.");
+                }
+            }
+            Err(e) => {
+                if options.aicx_strict {
+                    return Err(e);
+                } else {
+                    println!("Warning: sidecar discovery error: {}", e);
                 }
             }
         }
+    }
+
+    if is_aicx && sidecar_ref.is_none() {
+        let computed_hash = blake3::hash(&prepared).to_hex().to_string();
+        let ref_json = serde_json::json!({
+            "aicx_archive_reference": computed_hash,
+            "manifest_digest": "",
+            "sidecar_digest": "",
+            "risk_level": "medium",
+            "risk_hints": Vec::<String>::new(),
+            "entrypoint_candidate": None::<String>,
+            "query_hints": Vec::<String>::new(),
+        });
+        sidecar_ref = Some(ref_json.to_string());
     }
 
     let compressed = compress(&prepared, options.compression.clone())?;
@@ -429,14 +829,6 @@ pub fn pack(input: &Path, passphrase: &str, options: PackOptions) -> Result<Caps
     let (salt, nonce, ciphertext, payload_hash) =
         encrypt_payload(passphrase, &bundle_id, &policy, &compressed)?;
     let encrypted_hash = hash_bytes(&ciphertext);
-
-    let pack_event = AuditEvent {
-        timestamp: created_at.clone(),
-        actor: "local".into(),
-        action: AuditAction::Pack,
-        result: "ok".into(),
-        notes: None,
-    };
 
     let mut capsule = Capsule {
         public_header: PublicHeader {
@@ -458,20 +850,36 @@ pub fn pack(input: &Path, passphrase: &str, options: PackOptions) -> Result<Caps
         section_table: vec![],
         trust_block: None,
         policy_block: policy,
+        enterprise_policy_placeholder: Some(serde_cbor::Value::Text(
+            "future-enterprise-policy".into(),
+        )),
+        approval_tokens_placeholder: Some(serde_cbor::Value::Text("future-approval-tokens".into())),
         key_wrap_table_placeholder: Some("future-envelope-keys".into()),
         agent_index: AgentIndex {
             capsule_type: "aegisqr".into(),
             summary: format!("AegisQR capsule for {original_name}"),
             payload_type: payload_type.clone(),
-            entrypoint_candidate: None,
-            runtime_requirement: "none".into(),
+            entrypoint_candidate: parsed_sidecar
+                .as_ref()
+                .and_then(|d| d.entrypoint_candidate.clone()),
+            runtime_requirement: if is_aicx {
+                "aicx".into()
+            } else {
+                "none".into()
+            },
             permissions_requested: vec![],
             expected_outputs: vec!["restored-payload".into()],
             input_schema_placeholder: Some("future-input-schema".into()),
-            risk_level: "medium".into(),
+            risk_level: parsed_sidecar
+                .as_ref()
+                .map(|d| d.risk_level.clone())
+                .unwrap_or_else(|| "medium".into()),
             auto_execute_declaration,
-            aicx_sidecar: options.aicx_sidecar,
-            toon_export_placeholder: Some("future-toon-export".into()),
+            aicx_sidecar_reference_placeholder: sidecar_ref,
+            toon_export_placeholder: parsed_sidecar
+                .as_ref()
+                .and_then(|d| d.query_hints.first().cloned())
+                .or_else(|| Some("future-toon-export".into())),
         },
         semantic_index_placeholder: Some("future-semantic-index".into()),
         workflow_section_placeholder: Some("future-workflow-section".into()),
@@ -496,11 +904,7 @@ pub fn pack(input: &Path, passphrase: &str, options: PackOptions) -> Result<Caps
         },
         chunk_table: vec![],
         recovery_metadata_placeholder: Some("future-recovery-metadata".into()),
-        enterprise_policy: None,
-        audit_log: vec![AuditRecord {
-            events: vec![pack_event],
-        }],
-        approval_tokens: vec![],
+        audit_metadata_placeholder: Some("future-audit-metadata".into()),
     };
 
     capsule.chunk_table = build_chunk_table(&capsule.payload_section.ciphertext, 1024);
@@ -673,12 +1077,67 @@ pub fn inspect_header(path: &Path) -> Result<PublicHeader> {
     Ok(read_capsule_file(path)?.public_header)
 }
 
+fn verify_capsule_structure(capsule: &Capsule) -> Result<()> {
+    if capsule.public_header.magic != "AQR1" {
+        bail!("invalid public header magic");
+    }
+    if capsule.public_header.version != AQR_VERSION {
+        bail!("unsupported public header version");
+    }
+    if !capsule.public_header.encrypted {
+        bail!("capsule must remain encrypted");
+    }
+    if !capsule.public_header.signed {
+        bail!("capsule must remain signed");
+    }
+    if !capsule.public_header.requires_signature {
+        bail!("capsule must require signatures");
+    }
+    if !capsule.public_header.requires_policy {
+        bail!("capsule must require policy");
+    }
+    if capsule.public_header.auto_execute_default {
+        bail!("auto_execute_default must remain false");
+    }
+    if capsule.public_header.payload_type != capsule.payload_section.payload_type {
+        bail!("payload type mismatch between header and payload section");
+    }
+    if capsule.public_header.chunk_count as usize != capsule.chunk_table.len() {
+        bail!("public header chunk_count does not match chunk table");
+    }
+    if !capsule.public_header.auto_execute_capable && capsule.agent_index.auto_execute_declaration {
+        bail!("auto-execute declaration requires an auto-execute-capable capsule");
+    }
+    if capsule.payload_section.kdf != "argon2id" {
+        bail!("unsupported payload KDF");
+    }
+    if capsule.payload_section.cipher != "xchacha20poly1305" {
+        bail!("unsupported payload cipher");
+    }
+    if capsule.signature_block.signer_id.is_empty() {
+        bail!("missing signer identifier");
+    }
+
+    let expected_section_table = build_section_table(capsule)?;
+    if capsule.section_table != expected_section_table {
+        bail!("section table does not match capsule contents");
+    }
+
+    let expected_chunks = build_chunk_table(&capsule.payload_section.ciphertext, 1024);
+    if capsule.chunk_table != expected_chunks {
+        bail!("chunk table does not match ciphertext");
+    }
+
+    Ok(())
+}
+
 pub fn verify_capsule(
     path: &Path,
     trust_store: Option<&TrustStore>,
     strict_trust: bool,
 ) -> Result<()> {
     let capsule = read_capsule_file(path)?;
+    verify_capsule_structure(&capsule)?;
     verify_signature(&capsule)?;
 
     if strict_trust {
@@ -706,36 +1165,13 @@ pub fn verify_capsule(
             bail!("chunk hash mismatch");
         }
     }
-
-    // Enterprise approval gate: require the minimum number of valid approval
-    // tokens from authorised approvers before allowing the capsule through.
-    if let Some(ref policy) = capsule.enterprise_policy {
-        if policy.approval_required {
-            let now = unix_now();
-            let valid = capsule
-                .approval_tokens
-                .iter()
-                .filter(|t| {
-                    policy.approvers.contains(&t.approver_id)
-                        && t.bundle_id == capsule.public_header.bundle_id
-                        && t.verify().is_ok()
-                        && t.check_ttl(policy.approval_ttl_seconds, now).is_ok()
-                })
-                .count();
-            if valid < policy.min_approvals as usize {
-                bail!(
-                    "insufficient approvals: {valid} valid, {} required",
-                    policy.min_approvals
-                );
-            }
-        }
-    }
-
     Ok(())
 }
 
 pub fn decrypt_agent_index(path: &Path, passphrase: &str) -> Result<AgentIndex> {
     let capsule = read_capsule_file(path)?;
+    verify_capsule_structure(&capsule)?;
+    verify_signature(&capsule)?;
     let _ = decrypt_payload(
         passphrase,
         &capsule.public_header.bundle_id,
@@ -758,6 +1194,7 @@ pub fn stage_capsule(path: &Path, out_dir: &Path, passphrase: &str) -> Result<()
 
 fn restore_capsule(path: &Path, out_dir: &Path, passphrase: &str, force_stage: bool) -> Result<()> {
     let capsule = read_capsule_file(path)?;
+    verify_capsule_structure(&capsule)?;
     verify_signature(&capsule)?;
 
     let decrypted = decrypt_payload(
@@ -795,9 +1232,7 @@ fn restore_tar(bytes: &[u8], out_dir: &Path, force_stage: bool) -> Result<()> {
         let mut file = file?;
         let path = file.path()?;
         let rel = path.as_ref();
-        validate_relative(rel)?;
-
-        let target = out_dir.join(rel);
+        let target = safe_join(out_dir, rel)?;
         if file.header().entry_type().is_symlink() || file.header().entry_type().is_hard_link() {
             bail!("symlink escape is blocked");
         }
@@ -959,6 +1394,21 @@ pub fn import_qr_packets(packet_dir: &Path, out_path: &Path) -> Result<()> {
         if packet.version != AQR_VERSION {
             bail!("unsupported packet version");
         }
+        if packet.bundle_id.is_empty() {
+            bail!("missing bundle ID");
+        }
+        if packet.capsule_hash.is_empty() {
+            bail!("missing capsule hash");
+        }
+        if packet.checksum.is_empty() {
+            bail!("missing packet checksum");
+        }
+        if packet.total == 0 {
+            bail!("invalid packet total");
+        }
+        if packet.index >= packet.total {
+            bail!("packet index out of range");
+        }
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(packet.payload_b64.as_bytes())
             .context("invalid packet base64")?;
@@ -966,12 +1416,12 @@ pub fn import_qr_packets(packet_dir: &Path, out_path: &Path) -> Result<()> {
             bail!("packet checksum verification failed");
         }
         if let Some(existing) = by_index.get(&packet.index) {
-            if existing.checksum != packet.checksum {
+            if existing != &packet {
                 bail!("duplicate conflicting chunks");
             }
-        } else {
-            by_index.insert(packet.index, packet);
+            continue;
         }
+        by_index.insert(packet.index, packet);
     }
 
     let first = by_index.values().next().unwrap();
@@ -1004,6 +1454,9 @@ pub fn import_qr_packets(packet_dir: &Path, out_path: &Path) -> Result<()> {
     if &actual_hash != expected_hash {
         bail!("capsule hash mismatch");
     }
+    if out.len() < 4 || &out[..4] != AQR_MAGIC {
+        bail!("reconstructed bundle is not an AegisQR capsule");
+    }
     fs::write(out_path, out)?;
     Ok(())
 }
@@ -1016,120 +1469,34 @@ pub fn deny_execution_message(policy: &ClientPolicy, auto_execute_requested: boo
     }
 }
 
-// ─── Inspection ──────────────────────────────────────────────────────────────
-
-/// A lightweight summary of enterprise policy suitable for inspection output.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct EnterprisePolicySummary {
-    pub approval_required: bool,
-    pub min_approvals: u8,
-    /// Number of authorised approvers listed in the policy.
-    pub approvers_count: usize,
-    pub repo_target: Option<RepoTarget>,
-}
-
-/// Public-facing inspection report for a capsule — no decryption required.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CapsuleInspection {
-    pub public_header: PublicHeader,
-    pub aicx_sidecar: Option<AicxSidecar>,
-    pub enterprise_policy: Option<EnterprisePolicySummary>,
-    /// Number of approval tokens currently embedded in the capsule.
-    pub approval_count: usize,
-    /// Total number of audit events across all audit records.
-    pub audit_event_count: usize,
-}
-
-/// Returns a rich inspection report without decrypting the capsule payload.
-pub fn inspect_full(path: &Path) -> Result<CapsuleInspection> {
-    let capsule = read_capsule_file(path)?;
-    Ok(CapsuleInspection {
-        aicx_sidecar: capsule.agent_index.aicx_sidecar,
-        enterprise_policy: capsule.enterprise_policy.map(|p| EnterprisePolicySummary {
-            approval_required: p.approval_required,
-            min_approvals: p.min_approvals,
-            approvers_count: p.approvers.len(),
-            repo_target: p.repo_target,
-        }),
-        approval_count: capsule.approval_tokens.len(),
-        audit_event_count: capsule.audit_log.iter().map(|r| r.events.len()).sum(),
-        public_header: capsule.public_header,
-    })
-}
-
-// ─── Approval ────────────────────────────────────────────────────────────────
-
-/// Creates a signed [`ApprovalToken`] using the provided raw 32-byte Ed25519 seed.
-///
-/// The signing payload is `"{bundle_id}|{approver_id}|{approved_at}"`.
-pub fn create_approval_token(
-    bundle_id: &str,
-    approver_id: &str,
-    signing_key_seed: &[u8],
-) -> Result<ApprovalToken> {
-    let seed: &[u8; 32] = signing_key_seed
-        .try_into()
-        .map_err(|_| anyhow::anyhow!("signing key seed must be exactly 32 bytes"))?;
-    let signing_key = SigningKey::from_bytes(seed);
-    let approved_at = chrono_like_now();
-    let mut token = ApprovalToken {
-        bundle_id: bundle_id.to_string(),
-        approver_id: approver_id.to_string(),
-        approved_at,
-        signature: vec![],
-        public_key: signing_key.verifying_key().to_bytes().to_vec(),
-    };
-    let sig = signing_key.sign(&token.signing_payload());
-    token.signature = sig.to_bytes().to_vec();
-    Ok(token)
-}
-
-/// Appends a signed approval token to an existing capsule file.
-///
-/// The original Ed25519 signature covering the capsule's core content is
-/// unaffected: approval tokens are stored separately and carry their own
-/// signatures.  Writes the result to `out` (which may equal `path`).
-pub fn approve_capsule(
-    path: &Path,
-    approver_id: &str,
-    signing_key_seed: &[u8],
-    out: &Path,
-) -> Result<ApprovalToken> {
-    let mut capsule = read_capsule_file(path)?;
-    let token = create_approval_token(
-        &capsule.public_header.bundle_id.clone(),
-        approver_id,
-        signing_key_seed,
-    )?;
-    capsule.approval_tokens.push(token.clone());
-    capsule.audit_log.push(AuditRecord {
-        events: vec![AuditEvent {
-            timestamp: chrono_like_now(),
-            actor: approver_id.to_string(),
-            action: AuditAction::Approve,
-            result: "ok".into(),
-            notes: Some(format!(
-                "approval token issued for bundle {}",
-                capsule.public_header.bundle_id
-            )),
-        }],
-    });
-    write_capsule_file(out, &capsule)?;
-    Ok(token)
-}
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
 fn chrono_like_now() -> String {
-    let ts = unix_now();
-    format!("{ts}")
+    current_timestamp_secs().to_string()
 }
 
-fn unix_now() -> u64 {
+fn current_timestamp_secs() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+const MAX_SIGNATURE_EXPIRATION_SECS: u64 = 253_402_300_799;
+
+fn parse_timestamp_secs(ts: &str) -> Result<u64> {
+    if ts.is_empty() {
+        bail!("timestamp cannot be empty");
+    }
+    if ts.len() > 20 {
+        bail!("timestamp exceeds supported range");
+    }
+
+    let parsed: u64 = ts.parse()?;
+    if parsed > MAX_SIGNATURE_EXPIRATION_SECS {
+        bail!("timestamp exceeds supported range");
+    }
+
+    Ok(parsed)
 }
 
 #[cfg(test)]
@@ -1137,6 +1504,15 @@ mod tests {
     use super::*;
     use std::path::Path;
     use tempfile::tempdir;
+
+    fn resign_capsule_for_test(capsule: &mut Capsule) {
+        let signing_key = SigningKey::generate(&mut OsRng);
+        let payload = signature_payload(capsule).unwrap();
+        let sig = signing_key.sign(&payload);
+        capsule.signature_block.signer_id = "test-signer".into();
+        capsule.signature_block.public_key = signing_key.verifying_key().to_bytes().to_vec();
+        capsule.signature_block.signature = sig.to_bytes().to_vec();
+    }
 
     #[test]
     fn public_header_creation() {
@@ -1196,6 +1572,53 @@ mod tests {
         let mut tampered = capsule.clone();
         tampered.public_header.profile = "changed".into();
         assert!(verify_signature(&tampered).is_err());
+    }
+
+    #[test]
+    fn expired_signature_is_rejected_for_verify_and_restore() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("a.txt");
+        fs::write(&src, b"abc").unwrap();
+        let bundle = dir.path().join("expired.aqr");
+        pack_to_file(&src, &bundle, "pw", PackOptions::default()).unwrap();
+
+        let mut capsule = read_capsule_file(&bundle).unwrap();
+        capsule.signature_block.expiration = Some("0".into());
+        resign_capsule_for_test(&mut capsule);
+        write_capsule_file(&bundle, &capsule).unwrap();
+
+        assert!(verify_signature(&capsule).is_err());
+        assert!(verify_capsule(&bundle, None, false).is_err());
+        assert!(unpack_capsule(&bundle, &dir.path().join("out"), "pw").is_err());
+    }
+
+    #[test]
+    fn invalid_signature_expiration_is_rejected() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("a.txt");
+        fs::write(&src, b"abc").unwrap();
+        let mut capsule = pack(&src, "pw", PackOptions::default()).unwrap();
+        capsule.signature_block.expiration = Some("not-a-timestamp".into());
+        resign_capsule_for_test(&mut capsule);
+
+        assert!(verify_signature(&capsule).is_err());
+    }
+
+    #[test]
+    fn out_of_range_signature_expiration_is_rejected() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("a.txt");
+        fs::write(&src, b"abc").unwrap();
+        let mut capsule = pack(&src, "pw", PackOptions::default()).unwrap();
+        capsule.signature_block.expiration = Some((MAX_SIGNATURE_EXPIRATION_SECS + 1).to_string());
+        resign_capsule_for_test(&mut capsule);
+
+        assert!(verify_signature(&capsule).is_err());
+    }
+
+    #[test]
+    fn excessively_long_signature_expiration_is_rejected() {
+        assert!(parse_timestamp_secs("999999999999999999999").is_err());
     }
 
     #[test]
@@ -1398,6 +1821,29 @@ mod tests {
     }
 
     #[test]
+    fn import_qr_rejects_out_of_range_index() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("a.txt");
+        fs::write(&src, b"abc").unwrap();
+        let out = dir.path().join("x.aqr");
+        pack_to_file(&src, &out, "pw", PackOptions::default()).unwrap();
+        let qr = dir.path().join("qr");
+        export_qr_packets(&out, &qr, 32, false).unwrap();
+
+        let mut packet: QrPacket =
+            serde_cbor::from_slice(&fs::read(qr.join("packet-0000.cbor")).unwrap()).unwrap();
+        packet.index = packet.total;
+        fs::write(
+            qr.join("packet-0000.cbor"),
+            serde_cbor::to_vec(&packet).unwrap(),
+        )
+        .unwrap();
+
+        let recovered = dir.path().join("recovered.aqr");
+        assert!(import_qr_packets(&qr, &recovered).is_err());
+    }
+
+    #[test]
     fn auto_execute_requested_without_capable_is_normalised_to_false() {
         // Bug-fix regression: if auto_execute_capable is false, the capsule must
         // not declare auto_execute_declaration=true even when
@@ -1444,5 +1890,100 @@ mod tests {
         );
         // Signature verification must still succeed.
         verify_signature(&capsule).unwrap();
+    }
+
+    #[test]
+    fn verify_capsule_rejects_invalid_public_header_magic_even_if_resigned() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("hello.txt");
+        fs::write(&src, b"hello").unwrap();
+        let bundle = dir.path().join("bundle.aqr");
+        pack_to_file(&src, &bundle, "pw", PackOptions::default()).unwrap();
+
+        let mut capsule = read_capsule_file(&bundle).unwrap();
+        capsule.public_header.magic = "BAD!".into();
+        resign_capsule_for_test(&mut capsule);
+        write_capsule_file(&bundle, &capsule).unwrap();
+
+        assert!(verify_capsule(&bundle, None, false).is_err());
+    }
+
+    #[test]
+    fn agent_index_serialization_preserves_legacy_enterprise_field_names() {
+        let agent_index = AgentIndex {
+            capsule_type: "aegisqr".into(),
+            summary: "test".into(),
+            payload_type: PayloadType::RawFile,
+            entrypoint_candidate: None,
+            runtime_requirement: "none".into(),
+            permissions_requested: vec![],
+            expected_outputs: vec![],
+            input_schema_placeholder: None,
+            risk_level: "medium".into(),
+            auto_execute_declaration: false,
+            aicx_sidecar_reference_placeholder: Some("sidecar".into()),
+            toon_export_placeholder: Some("toon".into()),
+        };
+
+        let value = serde_json::to_value(&agent_index).unwrap();
+        let obj = value.as_object().unwrap();
+        assert!(obj.contains_key("aicx_sidecar"));
+        assert!(obj.contains_key("toon_export"));
+        assert!(!obj.contains_key("aicx_sidecar_reference_placeholder"));
+        assert!(!obj.contains_key("toon_export_placeholder"));
+    }
+
+    #[test]
+    fn capsule_serialization_preserves_enterprise_placeholder_fields() {
+        let dir = tempdir().unwrap();
+        let src = dir.path().join("hello.txt");
+        fs::write(&src, b"hello").unwrap();
+        let capsule = pack(&src, "pw", PackOptions::default()).unwrap();
+
+        let value = serde_json::to_value(&capsule).unwrap();
+        let obj = value.as_object().unwrap();
+        assert!(obj.contains_key("enterprise_policy"));
+        assert!(obj.contains_key("approval_tokens"));
+    }
+
+    #[test]
+    fn retail_profile_sign_verify_and_expire() {
+        let privkey_bytes = [7u8; 32];
+        let signing_key = SigningKey::from_bytes(&privkey_bytes);
+        let pubkey_bytes = signing_key.verifying_key().to_bytes().to_vec();
+
+        let mut trust_store = TrustStore::default();
+        trust_store.add_signer("key-1", pubkey_bytes);
+
+        let payload = RetailPayload {
+            retailer_id: "aegisqr".into(),
+            sku: "12345".into(),
+            upc: Some("54321".into()),
+            store_id: "store-0452".into(),
+            aisle: Some("A5".into()),
+            bay: Some("B2".into()),
+            shelf: Some("S1".into()),
+            campaign_id: Some("fall-promo".into()),
+            experience_id: Some("exp-1".into()),
+            role: Some("customer".into()),
+            label_version: 1,
+            issued_at: 1000,
+            expires_at: 2000,
+            fallback_url_id: Some("fallback-1".into()),
+        };
+
+        let token = sign_retail_payload(payload.clone(), &privkey_bytes, "key-1".into()).unwrap();
+        let verified = verify_retail_payload(&token, &trust_store, 1500).unwrap();
+        assert_eq!(verified.sku, "12345");
+        assert_eq!(verified.store_id, "store-0452");
+
+        assert!(verify_retail_payload(&token, &trust_store, 2500).is_err());
+
+        let empty_store = TrustStore::default();
+        assert!(verify_retail_payload(&token, &empty_store, 1500).is_err());
+
+        let mut tampered = token.clone();
+        tampered.push('A');
+        assert!(verify_retail_payload(&tampered, &trust_store, 1500).is_err());
     }
 }
