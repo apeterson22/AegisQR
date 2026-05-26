@@ -516,11 +516,34 @@ See [`SPEC.md`](SPEC.md) for the complete schema.
 
 ---
 
-## AegisQR and AICX Integration
+## Integration with AICX and the AegisQR Suite
 
-AegisQR integrates with the sibling **AICX** (AI-native adaptive compression and semantic archive) library via loose, contract-based integration. AegisQR acts as a secure courier wrapping compressed `.aicx` archives, validating their metadata sidecars, and encoding key contexts into signed, offline-capable deep links.
+AegisQR and **AICX** (AI-native adaptive compression and semantic archive) are designed as sibling, decoupled repositories that communicate strictly via deterministic metadata sidecars and CLI workflows. Together, they form the **AegisQR Suite**—a unified enterprise package for zero-trust secure transport, planogram role gating, and RAG context verification.
 
-### 1. AICX Sidecar Ingestion
+Within the suite, AegisQR serves as the **cryptographic envelope and physical courier layer**, protecting the integrity and confidentiality of the highly optimized `.aicx` knowledge archives.
+
+### 1. Unified Suite Architecture
+* **AICX Role:** Formats, compresses, and generates machine-readable indexes and ScoutAI query sidecars for directories, models, or catalogs.
+* **AegisQR Role:** Encapsulates the compressed `.aicx` archive into a secure `.aqr` capsule, enforces role-gating (customer vs associate), signs the header with Ed25519, and splits the payload into visual QR packet sequences for off-grid camera transit.
+* **AegisQR Suite Role:** Provides the overall distribution layer at the repository root, bundling both binaries into a single, unified installation script (`install.sh`), ensuring version alignment (`VERSION.json`), and presenting a unified management CLI.
+
+```mermaid
+graph TD
+    A[Raw Local Directory] -- "1. aicx pack" --> B[Deterministic .aicx Archive]
+    B -- "Generates sidecar" --> C[.sidecar.json Metadata]
+    B & C -- "2. aegisqr pack --aicx" --> D[Encrypted & Signed .aqr Capsule]
+    D -- "3. aegisqr export qr" --> E[Scannable QR Packets]
+    E -- "Camera / Scanner" --> F[Reassembled .aqr Capsule]
+    F -- "4. aegisqr unpack" --> G[Restored .aicx Archive]
+    G -- "5. aicx verify & unpack" --> H[Safe Extracted Directory]
+```
+
+### 2. Coordinated Enterprise Licensing
+Both applications share the exact same cryptographic, offline-first licensing core, validating organization tiers and seat counts natively without calling home:
+* **Shared Config Paths:** Installing a `.aqlic` file with `aegisqr license install` automatically updates `/etc/aegisqr/license.aqlic` or `~/.config/aegisqr/license.aqlic`, immediately activating license permissions for `aicx` as well.
+* **Shared Key Rotation:** Trust directories in `/etc/aegisqr/trusted_keys.d/` dynamically rotate Ed25519 signing keys for both tools concurrently.
+
+### 3. AICX Sidecar Ingestion
 
 #### When to Use
 Use AICX sidecar ingestion when you want to wrap a deterministic, compressed `.aicx` archive into a secure AegisQR capsule (`.aqr`) while enriching the capsule's unencrypted `AgentIndex` with archive intelligence (such as risk hints, entrypoints, and query hints) to let edge AI nodes or agents inspect the archive's metadata without requiring the decryption passphrase.
