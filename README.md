@@ -598,15 +598,75 @@ aegisqr verify-retail \
 
 ---
 
-## Project status and roadmap
+## Enterprise Licensing & Administration
 
-MVP is implemented with:
+AegisQR includes an offline-first cryptographic licensing subsystem that validates operational seat counts, validity parameters, and enterprise features without requiring a network connection or telemetry transmission (protecting corporate privacy).
 
-- Rust-first workspace crates
-- AQR1 capsule data model and deterministic serialization
-- Passphrase encryption, Ed25519 signing, zstd compression
-- QR packet export and import with full hash verification
-- Safe staging and quarantine with path-traversal and symlink protection
-- Unit tests, integration tests, and CI
+### License Configuration Directories
+AegisQR searches for installed `.aqlic` license files in the following order:
+1. `AEGISQR_LICENSE_PATH` environment variable.
+2. Global config: `/etc/aegisqr/license.aqlic`
+3. Portable User configuration: `~/.config/aegisqr/license.aqlic`
+4. Local workspace directories: `./license.aqlic` and `./.aegisqr.aqlic`
 
-See [`PLAN.md`](PLAN.md) for the phased roadmap (AICX deeper integration, hardware keys, animated QR, mobile scanner, WASM runtime, Reed-Solomon recovery, reproducible builds).
+To support rotating enterprise licensing keys, copy supplementary public keys in hex format into:
+`/etc/aegisqr/trusted_keys.d/` or `~/.config/aegisqr/trusted_keys.d/`
+
+### Licensing CLI Reference
+
+##### 1. Install an Enterprise License
+Install an authentic `.aqlic` file to the config paths (it is validated before copy):
+```bash
+aegisqr license install ./my_license.aqlic
+```
+
+##### 2. Check License Status
+Query current license validity state:
+```bash
+aegisqr license status
+```
+*Tip:* Mandate the `--json` output option for programmatic parent-process checks:
+```bash
+aegisqr license status --json
+```
+
+##### 3. View Full License Structure
+```bash
+aegisqr license show --json
+```
+
+### Expiration & Grace Period Behavior
+* **Active Grace Days:** The tool executes successfully but writes a clear warning to `stderr` on every run:
+  `WARNING: License expired. Running in grace period: X days remaining.`
+* **Expired Trial Reminders:** If unlicensed or fully expired, core utilities **are never blocked** (ensuring data restore operations are safe). Instead, a developer-friendly weekly trial reminder requesting coffee donations is output to `stderr` on Mondays.
+
+---
+
+## Standardized JSON Output for Programmatic Integration
+
+To support seamless enterprise child-process wrappers (such as Python `subprocess` or Node `child_process` orchestrators), all key query commands support a standardized `--json` flag. The returned JSON schema is version-locked, preventing upstream structural breaks.
+
+For example, to verify a retail label deep-link and parse its signed payload programmatically:
+```bash
+aegisqr verify-retail --url-file signed_link.txt --pubkey <KEY> --kid <KID> --json
+```
+
+---
+
+## 🛡️ Mission: Security & Secure Information Sharing in the AI Age
+
+In the era of autonomous AI agents, automated code generation, and hyper-connected supply chains, traditional perimeter security has collapsed. Information is no longer shared merely between human operators; it is ingested, transformed, and acted upon by AI models operating across untrusted network nodes.
+
+This technological revolution introduces critical security threats:
+1. **Adversarial Payload Injection:** Untrusted files, prompts, and model updates can exploit parsing pipelines, risking automated execution.
+2. **Data Leakage & Telemetry Risks:** Heavy telemetry-based licensing structures leak sensitive operational schemas, catalogs, and network locations to third-party servers.
+3. **Unsigned Agent Actions:** Unauthenticated code and tasks can run unchecked inside isolated corporate networks.
+
+### The AegisQR Solution: Cryptographic Zero-Trust
+
+AegisQR is engineered to establish **unbreakable cryptographic trust boundaries** for files and payloads before they reach downstream models or execution runtimes:
+* **Zero Trust Offline Validation:** Signature validation, decryption, and licensing run entirely offline. Your data never leaves your networks.
+* **Fail-Closed Gatekeeping:** Unknown signing keys, modified parameters, or malformed sidecars quarantine operations immediately.
+* **Sanitized Restores:** Files are compressed, encrypted, verified, and staged with strict path-traversal prevention and mandatory executable quarantining. Scans never execute code.
+
+By combining self-describing metadata packaging with robust Ed25519 signature enforcement and XChaCha20-Poly1305 payload insulation, AegisQR provides a cryptographic trust anchor, enabling humanity and autonomous AI agents to share critical store data, packages, and configurations safely, privately, and securely in the AI age.
