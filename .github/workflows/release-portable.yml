@@ -155,7 +155,7 @@ jobs:
         shell: bash
         run: cp "dist/aegisqr-${{ matrix.target }}/manifest.json" "dist/manifest-${{ matrix.target }}.json"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: portable-${{ matrix.target }}
           path: dist/*
