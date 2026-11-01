@@ -96,6 +96,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "aegisqr-mcp"
+version = "0.1.0-featured"
+dependencies = [
+ "aegisqr-core",
+ "anyhow",
+ "clap",
+ "hex",
+ "serde",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "aegisqr-policy"
 version = "0.1.0-featured"
 dependencies = [
