@@ -28,8 +28,9 @@ Initial required sections:
 - policy_block
 - agent_index
 - payload
-- signature_block
 - chunk_table
+
+The capsule still contains a `signature_block`, but the section table intentionally omits it. The signature block cannot safely hash itself during section-table construction, so integrity for that block is enforced by the Ed25519 signature rather than a stale self-referential section hash.
 
 ## Policy schema
 
@@ -65,6 +66,8 @@ Packet fields:
 - capsule_hash
 - payload_b64
 - checksum
+
+Import must reject packets with invalid magic/version, out-of-range indexes, conflicting duplicates, mixed bundle IDs, inconsistent totals or capsule hashes, or checksum / reconstructed-capsule mismatches.
 
 ## Versioning rules
 

@@ -20,49 +20,42 @@ dependencies = [
 
 [[package]]
 name = "aegisqr-agent"
-version = "0.1.0"
+version = "0.1.0-featured"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "aegisqr-audit"
-version = "0.1.0"
+version = "0.1.0-featured"
 dependencies = [
- "anyhow",
- "ed25519-dalek",
  "serde",
 ]
 
 [[package]]
 name = "aegisqr-cli"
-version = "0.1.0"
+version = "0.1.0-featured"
 dependencies = [
  "aegisqr-core",
- "aegisqr-repo",
  "anyhow",
  "clap",
  "hex",
- "rand 0.8.6",
- "serde",
+ "rpassword",
  "serde_json",
  "zeroize",
 ]
 
 [[package]]
 name = "aegisqr-container"
-version = "0.1.0"
+version = "0.1.0-featured"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "aegisqr-core"
-version = "0.1.0"
+version = "0.1.0-featured"
 dependencies = [
- "aegisqr-agent",
- "aegisqr-audit",
- "aegisqr-policy",
  "aes-gcm",
  "anyhow",
  "argon2",
@@ -79,6 +72,7 @@ dependencies = [
  "serde_cbor",
  "serde_json",
  "sha2",
+ "subtle",
  "tar",
  "tempfile",
  "thiserror 1.0.69",
@@ -89,64 +83,52 @@ dependencies = [
 
 [[package]]
 name = "aegisqr-crypto"
-version = "0.1.0"
+version = "0.1.0-featured"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "aegisqr-encoding"
-version = "0.1.0"
+version = "0.1.0-featured"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "aegisqr-policy"
-version = "0.1.0"
+version = "0.1.0-featured"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "aegisqr-qr"
-version = "0.1.0"
+version = "0.1.0-featured"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "aegisqr-recovery"
-version = "0.1.0"
+version = "0.1.0-featured"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "aegisqr-repo"
-version = "0.1.0"
-dependencies = [
- "aegisqr-core",
- "anyhow",
- "serde",
- "serde_json",
 ]
 
 [[package]]
 name = "aegisqr-runtime"
-version = "0.1.0"
+version = "0.1.0-featured"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "aegisqr-ui"
-version = "0.1.0"
+version = "0.1.0-featured"
 dependencies = [
  "aegisqr-core",
- "aegisqr-repo",
  "anyhow",
- "hex",
  "rpassword",
  "serde_json",
  "zeroize",

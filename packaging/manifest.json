@@ -1,0 +1,13 @@
+{
+  "name": "aegisqr",
+  "format_version": 1,
+  "version": "v0.0.0",
+  "target": "x86_64-unknown-linux-gnu",
+  "platform": "linux",
+  "archive_name": "aegisqr-x86_64-unknown-linux-gnu.tar.gz",
+  "bundle_contents": [
+    "aegisqr",
+    "manifest.json",
+    "trust-store.example.json"
+  ]
+}
