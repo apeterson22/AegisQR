@@ -381,19 +381,19 @@ fn main() -> Result<()> {
             }
             LicenseSub::Install { path } => {
                 let bytes = fs::read(&path).context("failed to read source license file")?;
-                let lic: aegisqr_core::license::LicenseFile = serde_json::from_slice(&bytes)
-                    .context("invalid license file format")?;
+                let lic: aegisqr_core::license::LicenseFile =
+                    serde_json::from_slice(&bytes).context("invalid license file format")?;
                 aegisqr_core::license::check_license_integrity(&lic)
                     .context("license integrity check failed (invalid signature or unknown key)")?;
 
                 let mut installed = false;
-                
+
                 // Try /etc/aegisqr
-                if fs::create_dir_all("/etc/aegisqr").is_ok() {
-                    if fs::write("/etc/aegisqr/license.aqlic", &bytes).is_ok() {
-                        installed = true;
-                        println!("Installed license to /etc/aegisqr/license.aqlic");
-                    }
+                if fs::create_dir_all("/etc/aegisqr").is_ok()
+                    && fs::write("/etc/aegisqr/license.aqlic", &bytes).is_ok()
+                {
+                    installed = true;
+                    println!("Installed license to /etc/aegisqr/license.aqlic");
                 }
 
                 if !installed {
@@ -428,7 +428,8 @@ fn main() -> Result<()> {
                         if json {
                             println!("{}", content.trim());
                         } else {
-                            let lic: aegisqr_core::license::LicenseFile = serde_json::from_str(&content)?;
+                            let lic: aegisqr_core::license::LicenseFile =
+                                serde_json::from_str(&content)?;
                             println!("{:#?}", lic);
                         }
                         found = true;

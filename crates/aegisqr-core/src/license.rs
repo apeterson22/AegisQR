@@ -1,12 +1,13 @@
-use std::collections::BTreeMap;
-use std::fs;
-use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 use base64::Engine;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::PathBuf;
 
-pub const ROOT_LICENSE_PUBKEY: &str = "66be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473a";
+pub const ROOT_LICENSE_PUBKEY: &str =
+    "66be7e332c7a453332bd9d0a7f7db055f5c5ef1a06ada66d98b39fb6810c473a";
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct CustomerInfo {
@@ -25,7 +26,7 @@ pub struct PlanInfo {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct ValidityInfo {
-    pub issued_at: String, // ISO 8601, e.g. "2026-05-25T00:00:00Z"
+    pub issued_at: String,  // ISO 8601, e.g. "2026-05-25T00:00:00Z"
     pub expires_at: String, // ISO 8601
     pub grace_days: u32,
 }
@@ -120,10 +121,16 @@ pub fn get_license_search_paths() -> Vec<PathBuf> {
     }
     paths.push(PathBuf::from("/etc/aegisqr/license.aqlic"));
     if let Ok(home) = std::env::var("HOME") {
-        paths.push(PathBuf::from(format!("{}/.config/aegisqr/license.aqlic", home)));
+        paths.push(PathBuf::from(format!(
+            "{}/.config/aegisqr/license.aqlic",
+            home
+        )));
     }
     if let Ok(userprofile) = std::env::var("USERPROFILE") {
-        paths.push(PathBuf::from(format!("{}/.config/aegisqr/license.aqlic", userprofile)));
+        paths.push(PathBuf::from(format!(
+            "{}/.config/aegisqr/license.aqlic",
+            userprofile
+        )));
     }
     paths.push(PathBuf::from("./license.aqlic"));
     paths.push(PathBuf::from("./.aegisqr.aqlic"));
@@ -134,10 +141,16 @@ pub fn get_trusted_keys_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     dirs.push(PathBuf::from("/etc/aegisqr/trusted_keys.d"));
     if let Ok(home) = std::env::var("HOME") {
-        dirs.push(PathBuf::from(format!("{}/.config/aegisqr/trusted_keys.d", home)));
+        dirs.push(PathBuf::from(format!(
+            "{}/.config/aegisqr/trusted_keys.d",
+            home
+        )));
     }
     if let Ok(userprofile) = std::env::var("USERPROFILE") {
-        dirs.push(PathBuf::from(format!("{}/.config/aegisqr/trusted_keys.d", userprofile)));
+        dirs.push(PathBuf::from(format!(
+            "{}/.config/aegisqr/trusted_keys.d",
+            userprofile
+        )));
     }
     dirs.push(PathBuf::from("./trusted_keys.d"));
     dirs
@@ -174,18 +187,25 @@ pub fn load_trusted_keys() -> BTreeMap<String, Vec<u8>> {
 pub fn check_license_integrity(license: &LicenseFile) -> Result<()> {
     let signature_info = license.signature.as_ref().context("license is unsigned")?;
     if signature_info.alg != "Ed25519" {
-        bail!("unsupported license signature algorithm: {}", signature_info.alg);
+        bail!(
+            "unsupported license signature algorithm: {}",
+            signature_info.alg
+        );
     }
 
     let trusted_keys = load_trusted_keys();
-    let pubkey_bytes = trusted_keys
-        .get(&signature_info.kid)
-        .ok_or_else(|| anyhow::anyhow!("unknown license signing key ID (kid): {}", signature_info.kid))?;
+    let pubkey_bytes = trusted_keys.get(&signature_info.kid).ok_or_else(|| {
+        anyhow::anyhow!(
+            "unknown license signing key ID (kid): {}",
+            signature_info.kid
+        )
+    })?;
 
     // Create canonical representation by removing signature field
     let mut canonical = license.clone();
     canonical.signature = None;
-    let canonical_bytes = serde_json::to_vec(&canonical).context("failed to serialize canonical license")?;
+    let canonical_bytes =
+        serde_json::to_vec(&canonical).context("failed to serialize canonical license")?;
 
     let sig_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(&signature_info.sig)
@@ -222,28 +242,32 @@ pub fn verify_license_status(current_time_secs: u64) -> LicenseStatus {
 
     let lic = match loaded_license {
         Some(l) => l,
-        None => return LicenseStatus {
-            status: "unlicensed".to_string(),
-            license_id: None,
-            organization: None,
-            tier: None,
-            seats: None,
-            expires_at: None,
-            days_remaining: None,
-        },
+        None => {
+            return LicenseStatus {
+                status: "unlicensed".to_string(),
+                license_id: None,
+                organization: None,
+                tier: None,
+                seats: None,
+                expires_at: None,
+                days_remaining: None,
+            }
+        }
     };
 
     let expires_secs = match parse_iso8601_to_unix(&lic.validity.expires_at) {
         Ok(t) => t,
-        Err(_) => return LicenseStatus {
-            status: "unlicensed".to_string(),
-            license_id: None,
-            organization: None,
-            tier: None,
-            seats: None,
-            expires_at: None,
-            days_remaining: None,
-        },
+        Err(_) => {
+            return LicenseStatus {
+                status: "unlicensed".to_string(),
+                license_id: None,
+                organization: None,
+                tier: None,
+                seats: None,
+                expires_at: None,
+                days_remaining: None,
+            }
+        }
     };
 
     let grace_secs = lic.validity.grace_days as u64 * 86400;
