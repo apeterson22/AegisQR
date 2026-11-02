@@ -14,10 +14,14 @@ AegisQR is a **secure, encrypted, signed, and compressed QR-native capsule forma
 6. [Build and install](#build-and-install)
 7. [Quick start](#quick-start)
 8. [CLI reference](#cli-reference)
-9. [Interactive UI](#interactive-ui-lightweight-alternative-to-the-cli)
-10. [Examples](#examples)
-11. [AQR1 capsule format overview](#aqr1-capsule-format-overview)
-12. [Project status and roadmap](#project-status-and-roadmap)
+9. [GS1 Digital Link 2027 & Omnichannel Retail](#gs1-digital-link-2027--omnichannel-retail)
+10. [Model Context Protocol (MCP) & Third-Party Agent Swarms](#model-context-protocol-mcp--third-party-agent-swarms)
+11. [Post-Quantum Cryptography (PQC)](#post-quantum-cryptography-pqc)
+12. [Interactive UI](#interactive-ui-lightweight-alternative-to-the-cli)
+13. [Examples](#examples)
+14. [AQR1 capsule format overview](#aqr1-capsule-format-overview)
+15. [Enterprise Licensing](#enterprise-licensing)
+16. [Mission & Security Roadmap](#mission--security-roadmap)
 
 ---
 
@@ -673,6 +677,89 @@ For example, to verify a retail label deep-link and parse its signed payload pro
 ```bash
 aegisqr verify-retail --url-file signed_link.txt --pubkey <KEY> --kid <KID> --json
 ```
+
+---
+
+## GS1 Digital Link 2027 & Omnichannel Retail
+
+AegisQR provides the complete drop-in cryptographic replacement for legacy 1D UPC/EAN barcodes ahead of the **GS1 Sunrise 2027** global mandate.
+
+### 1. Generating GS1 Digital Link 2027 URIs
+```bash
+aegisqr pack-gs1 \
+  --gtin 00812345678901 \
+  --sku SKU-POWER-DRILL \
+  --store 0452 \
+  --domain https://shop.brand.com \
+  --lot LOT-2026-X8 \
+  --serial SN-994821 \
+  --exp 1798761600 \
+  --out-url
+```
+
+### 2. Real-Time POS Verification & Ticket-Switching Defense
+```bash
+aegisqr verify-gs1 \
+  --url "https://shop.brand.com/01/00812345678901?p=eyJhbGciOiJFZDI1NTE5In0..." \
+  --pubkey e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 \
+  --json
+```
+**GS1 Invariant Enforcement**: If a customer swaps a $0.99 sticker onto a $249 drill, the verification fails immediately because the path GTIN (`00812345678901`) does not match the cryptographically signed internal SKU (`SKU-LEMON`).
+
+### 3. Electronic Shelf Labels (ESL)
+For digital e-ink price tags (SES-imagotag, Pricer, SoluM), AegisQR generates ultra-compact **89-byte binary packets** fitting into standard BLE extended advertisements and 915MHz Sub-GHz broadcasts:
+```bash
+# Generate 89-byte ESL binary packet
+aegisqr pack-esl --sku SKU-POWER-DRILL --store 0452 --price-cents 24999 --out-bytes
+
+# Verify ESL binary packet
+aegisqr verify-esl --packet-hex 41515245534c01... --pubkey <KEY>
+```
+
+### 4. POS & Handheld Scanner Daemon (`scan-daemon`)
+Integrate Zebra TC5x, Honeywell CT40, or self-checkout registers over a high-speed local UNIX domain socket or TCP port:
+```bash
+aegisqr scan-daemon --socket /run/pos/scanner.sock --pubkey-hex <KEY>
+```
+
+---
+
+## Model Context Protocol (MCP) & Third-Party Agent Swarms
+
+AegisQR is **vendor-neutral, harness-agnostic, and agent-agnostic**. The `aegisqr-mcp` binary implements the open JSON-RPC 2.0 Model Context Protocol (MCP) standard, exposing 15 tools to any third-party agent harness:
+* **Claude Desktop & Cursor**
+* **Antigravity CLI & Swarms**
+* **LangChain / LangGraph**
+* **AutoGen & CrewAI**
+* **LlamaIndex**
+* **Custom Enterprise Test Harnesses**
+
+### Exposed Tools for Autonomous Swarms
+1. `inspect_capsule`: Inspect header, chunks, and risk score without decrypting.
+2. `verify_capsule`: Cryptographic Ed25519 & BLAKE3 verification.
+3. `unpack_capsule`: Decrypt with mandatory executable quarantining (`auto_execute_default: false`).
+4. `pack_capsule`: Seal directory or file into `.aqr` with AICX sidecar binding.
+5. `pack_gs1_digital_link`: Generate signed GS1 2027 shelf tag URI.
+6. `verify_gs1_digital_link`: Verify GS1 URI, Luhn-10 check digit, and SKU invariant.
+7. `pack_esl_packet`: Generate compact 89-byte binary packet for e-ink displays.
+8. `verify_esl_packet`: Cryptographically verify 89-byte ESL display packet.
+9. `verify_retail_url`: Verify legacy retail deep-link with dual-persona SSO check.
+10. `pack_retail_url`: Generate signed retail deep-link URL.
+11. `sign_custody_transfer`: Autonomous AGV / robot custody transfer manifest.
+12. `verify_custody_receipt`: Non-repudiation receipt from recipient robot.
+13. `export_qr_packets`: Slice capsule into sequential air-gap QR packets.
+14. `import_qr_packets`: Reassemble capsule from optical QR packet sequence.
+15. `license_status`: Inspect offline `.aqlic` enterprise license.
+
+---
+
+## Post-Quantum Cryptography (PQC)
+
+For pharmaceutical track-and-trace, infant nutrition, and luxury goods with multi-year shelf lives, AegisQR provides **NIST FIPS 204 ML-DSA-65 (CRYSTALS-Dilithium3)** post-quantum hybrid signatures:
+```bash
+aegisqr pack-gs1 --gtin 00812345678901 --sku LUX-BAG-401 --pqc-hybrid --out-url
+```
+In hybrid mode, the envelope carries both classical Ed25519 and lattice-based ML-DSA signatures. Verification requires both signatures to succeed, protecting physical assets against future quantum attacks (Store-Now, Decrypt-Later).
 
 ---
 
