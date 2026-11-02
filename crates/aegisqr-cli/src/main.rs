@@ -582,14 +582,6 @@ fn main() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&out_json)?);
             } else {
                 println!("GS1 Digital Link Verification Succeeded!");
-                println!("GTIN: {}", verified.gtin);
-                if let Some(serial) = verified.serial {
-                    println!("Serial: {}", serial);
-                }
-                if let Some(lot) = verified.lot {
-                    println!("Lot: {}", lot);
-                }
-                println!("Payload: {:?}", verified.verified_retail_payload);
             }
         }
         Commands::Esl { sub } => match sub {
@@ -834,10 +826,7 @@ fn main() -> Result<()> {
                                         })
                                     );
                                 } else {
-                                    println!(
-                                        "[GS1 VALID] GTIN: {} | SKU: {}",
-                                        v.gtin, v.verified_retail_payload.sku
-                                    );
+                                    println!("[GS1 VALID]");
                                 }
                                 continue;
                             }
@@ -881,10 +870,7 @@ fn main() -> Result<()> {
                                         })
                                     );
                                 } else {
-                                    println!(
-                                        "[RETAIL VALID] Retailer: {} | SKU: {}",
-                                        payload.retailer_id, payload.sku
-                                    );
+                                    println!("[RETAIL VALID]");
                                 }
                                 continue;
                             }
