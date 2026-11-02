@@ -5,7 +5,7 @@
 
 `aegisqr-mcp` exposes high-assurance cryptographic verification, offline packaging, optical air-gap packet transport, and signed universal retail deep-linking primitives as a standard [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) JSON-RPC 2.0 stdio server.
 
-Designed specifically for AI agent swarms (Claude Desktop, Antigravity, Cursor, Solomon Prime, OpenClaw), `aegisqr-mcp` enables autonomous agents to safely analyze untrusted data capsules without risking host compromise.
+Designed specifically for AI agent swarms (Claude Desktop, Antigravity, Cursor, and enterprise autonomous swarms), `aegisqr-mcp` enables autonomous agents to safely analyze untrusted data capsules without risking host compromise.
 
 ---
 
