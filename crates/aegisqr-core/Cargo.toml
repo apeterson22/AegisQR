@@ -8,6 +8,7 @@ autobins = false
 [dependencies]
 anyhow.workspace = true
 argon2.workspace = true
+aegisqr-crypto = { path = "../aegisqr-crypto" }
 aes-gcm.workspace = true
 base64.workspace = true
 blake3.workspace = true
